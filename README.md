@@ -10,7 +10,7 @@ trial](https://www.cancerimagingarchive.net/collection/victre/) (Badano et al.,
 2018) and is intended as a benchmark for reconstruction research — distinct from
 existing VICTRE-derived resources, which target detection and segmentation.
 
-- **Data record (DOI):** _to be assigned (Zenodo / Hugging Face)_
+- **Data record (DOI):** (https://huggingface.co/datasets/yusuf-talha/victre-paired)
 - **Paper:** _Data Descriptor, in preparation_
 
 ---
