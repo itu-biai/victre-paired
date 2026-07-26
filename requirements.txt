@@ -1,0 +1,21 @@
+# Core numerics
+numpy>=1.24
+scipy>=1.10
+pandas>=2.0
+
+# Reconstruction / deep-learning backend (GPU)
+torch>=2.0
+
+# DICOM I/O (VICTRE source data)
+pydicom>=2.4
+
+# Figures and tables
+matplotlib>=3.7
+tabulate>=0.9
+
+# Progress bars (validation)
+tqdm>=4.65
+
+# Reconstruction operators — installed separately from source:
+#   git clone --depth 1 https://github.com/LLNL/LEAP.git && pip install ./LEAP
+# (provides the `leapctype` module used by geometry.py and run_baselines.py)
