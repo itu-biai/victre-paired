@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# DATASET CHARACTERIZATION FIGURES v2 — English, publication quality
+# DATASET CHARACTERIZATION FIGURES
 #   Fixes vs v1:
 #     • Curve (a): full 25-angle tissue-level profile (was only 3 points).
 #     • Montage: crop projection panels to breast (shared bbox, parallax kept)
