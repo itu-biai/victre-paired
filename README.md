@@ -1,6 +1,6 @@
-# VICTRE-PAIRED v6
+# VICTRE-Paired
 
-Reproduction code for **VICTRE-PAIRED v6**, an open dataset for limited-angle
+Reproduction code for **VICTRE-Paired**, an open dataset for limited-angle
 digital breast tomosynthesis (DBT) reconstruction. Each sample pairs the raw
 Monte-Carlo projections of a virtual patient with the reconstructed volume, and
 adds phantom-accurate lesion locations and multiple dose levels.
@@ -10,7 +10,7 @@ trial](https://www.cancerimagingarchive.net/collection/victre/) (Badano et al.,
 2018) and is intended as a benchmark for reconstruction research — distinct from
 existing VICTRE-derived resources, which target detection and segmentation.
 
-- **Data record (DOI):** (https://huggingface.co/datasets/yusuf-talha/victre-paired)
+- **Data record:** [huggingface.co/datasets/yusuf-talha/victre-paired](https://huggingface.co/datasets/yusuf-talha/victre-paired) (DOI: _to be assigned_)
 - **Paper:** _Data Descriptor, in preparation_
 
 ---
@@ -71,7 +71,8 @@ victre-paired-v6/
     ├── generate_dataset.py     build the dataset from VICTRE source data
     ├── validate_dataset.py     technical validation (integrity + physics)
     ├── geometry.py             LEAP forward / adjoint operators
-    ├── run_baselines.py        two-regime baselines + metrics (incl. scale-matched PSNR)
+    ├── run_baselines.py        two-regime baselines (FBP, ATp, SIRT, SART, ASD-POCS)
+    │                           + masked correlation, scale-matched PSNR, background energy
     └── figures/
         ├── make_dataset_figures.py    dataset characterization figures
         └── make_baseline_figures.py   baseline tables and figures
@@ -153,9 +154,33 @@ python src/run_baselines.py            # writes per-patient metrics for the test
 python src/figures/make_baseline_figures.py
 ```
 
-`run_baselines.py` reconstructs every test patient with eight classical methods
-(Aᵀp; SIRT-20/50/100; SART-2/4/8; ASD-POCS-20) under **both** regimes and reports
-correlation, PSNR (raw and scale-matched), SSIM and lesion SDNR.
+`run_baselines.py` reconstructs every test patient with nine classical methods
+(FBP; Aᵀp; SIRT-20/50/100; SART-2/4/8; ASD-POCS-20) under **both** regimes.
+
+FBP is implemented from scratch (Hann-windowed ramp filter, edge-replicate
+padding, approximate cosine weighting) rather than adapted from VICTRE's own
+GPL-licensed reconstruction code, which is neither read nor copied here. Two
+built-in LEAP FBP routes were tried and rejected during development: `L.FBP()`
+returns a degenerate result on this modular-beam geometry, and
+`L.filterProjections()` is a silent no-op on this geometry (its output is
+numerically identical to unfiltered back-projection) — a useful reminder to
+sanity-check library routines against a known baseline (e.g. Aᵀp) before
+trusting their output.
+
+**Metrics and metric hierarchy.** Six metrics are recorded per reconstruction:
+breast-masked correlation (`corr_mask`, **primary** cross-regime metric),
+whole-volume correlation (`corr`, diagnostic), raw and scale-matched PSNR,
+global SSIM, background energy (`bg`, diagnostic), and mass SDNR.
+
+Whole-volume correlation is confounded by background behaviour: FBP's ramp
+filter leaks energy into the zero-padded regions of the projections (dead
+detector frame, penumbra strip), inflating background intensity, while Aᵀp
+drives the background to near zero "for free". Since background voxels
+dominate the volume by count, whole-volume correlation rewards a clean
+background over faithful breast reconstruction — in this dataset it can even
+invert the ranking of methods relative to what is visible inside the breast.
+`corr_mask`, computed only inside the breast mask, is the metric reported as
+primary in the paper; `corr` and `bg` are kept as diagnostics.
 
 ---
 
@@ -174,8 +199,18 @@ The dataset can drive reconstruction from two projection sources:
 
 The mismatch is quantified in the paper: iterative reconstruction *improves* under
 `A(clean)` but *degrades* under `clean_proj` (the signature of forward-model
-mismatch), and the ideal–real gap grows with iteration count. Report both regimes
-when benchmarking; the gap measures a method's robustness to model mismatch.
+mismatch), and the ideal–real gap grows monotonically with a method's reliance on
+the forward operator — from FBP (a single filtered back-projection, no
+data-consistency loop, gap ≈ 0.09 in breast-masked correlation) to SIRT-100 (100
+enforcements, gap ≈ 0.73). Report both regimes when benchmarking; the gap
+measures a method's robustness to model mismatch.
+
+Notably, FBP's *whole-volume* correlation is essentially unchanged between
+regimes (real ≳ ideal): because `clean` is itself produced by filtering and
+back-projecting the real Monte-Carlo projections, applying FBP to those same
+projections approximately retraces that production path — an incidental,
+partial check that the projection pipeline (flat-field estimate, alignment
+offsets, geometry) is self-consistent with how the reference volume was made.
 
 ---
 
