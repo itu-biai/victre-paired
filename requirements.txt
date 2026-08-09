@@ -1,21 +1,18 @@
-# Core numerics
+# VICTRE-Paired — reproduction requirements
+#
+# Python >= 3.10. A CUDA GPU is required for the reconstruction operators:
+# geometry.py, run_baselines.py, and the GPU stages (6-9) of
+# validate_dataset.py. Dataset generation, the rest of validate_dataset.py,
+# and both figures/make_*_figures.py scripts run on CPU only.
+#
+# LEAP (the LivermorE AI Projector) is NOT on PyPI and must be installed from
+# source separately:
+#     git clone --depth 1 https://github.com/LLNL/LEAP.git
+#     pip install ./LEAP
+
 numpy>=1.24
 scipy>=1.10
-pandas>=2.0
-
-# Reconstruction / deep-learning backend (GPU)
-torch>=2.0
-
-# DICOM I/O (VICTRE source data)
-pydicom>=2.4
-
-# Figures and tables
 matplotlib>=3.7
-tabulate>=0.9
-
-# Progress bars (validation)
-tqdm>=4.65
-
-# Reconstruction operators — installed separately from source:
-#   git clone --depth 1 https://github.com/LLNL/LEAP.git && pip install ./LEAP
-# (provides the `leapctype` module used by geometry.py and run_baselines.py)
+pandas>=2.0
+pydicom>=2.4          # reading VICTRE source DICOM (generation only)
+torch>=2.0            # LEAP backend; install the CUDA build for your platform
