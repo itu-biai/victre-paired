@@ -87,16 +87,23 @@ victre-paired/
 ├── README.md
 ├── requirements.txt
 ├── LICENSE
+├── .gitignore
 └── src/
     ├── constants.py            shared geometry / dose / split parameters
     ├── generate_dataset.py     build the dataset from VICTRE source data
     ├── validate_dataset.py     technical validation (integrity + physics + baselines)
     ├── geometry.py             LEAP forward / adjoint operators from geom_* fields
-    ├── run_baselines.py        two-regime baselines (9 classical methods)
+    ├── run_baselines.py        two-regime reconstruction (9 methods) -> baseline_raw.csv
     └── figures/
-        ├── make_dataset_figures.py    dataset characterization figures
-        └── make_baseline_figures.py   baseline tables and figures
+        ├── make_baseline_figures.py   baseline_raw.csv -> Table 3 + F5/F5b/F5c/F6
+        └── make_dataset_figures.py    validate_dataset.py's tables -> F1/F2/F3/F4/F6/F7
 ```
+
+`run_baselines.py` only reconstructs and scores (needs a GPU); the two
+`figures/` scripts turn its CSV output, and `validate_dataset.py`'s, into the
+paper's tables and figures and do not need a GPU themselves (except for
+`make_baseline_figures.py`'s optional F6 gallery, which re-runs a few
+reconstructions for illustration).
 
 ---
 
@@ -195,11 +202,12 @@ regardless of run order or interruptions.
 ## Technical validation
 
 ```bash
-python src/validate_dataset.py
+python src/validate_dataset.py --data /path/to/victre-paired --out ./validation_report --profile quick
+python src/figures/make_dataset_figures.py --validation ./validation_report
 ```
 
-Checks, over the full population where cheap and on a stratified sample for the
-heavy per-array measurements:
+`validate_dataset.py` checks, over the full population where cheap and on a
+stratified sample for the heavy per-array measurements:
 
 - **Integrity** — schema, dtypes, shapes, constants, no NaN/Inf, no duplicate
   seeds, split disjointness, and the analytic geometry formula (all 2761 patients).
@@ -208,24 +216,34 @@ heavy per-array measurements:
   ≈ 1/cos 25° = 1.10.
 - **Noise** — measured vs. stored `sigma`, dose monotonicity, whiteness, and
   **bit-exact reproduction** of every `noisy_proj` array from `noise_seed`.
-- **Geometry** — residual parallax between `A(clean)` and `clean_proj`.
+- **Geometry** — residual parallax between `A(clean)` and `clean_proj` (needs a GPU).
 - **Task-based** — mass/control SDNR, d′, AUC; unbiased-estimator check on control ROIs.
 
-It writes a JSON/Markdown report reproducing the numbers in the paper's
-Technical Validation section.
+It writes `report.md` / `results.json` reproducing the numbers in the paper's
+Technical Validation section, plus per-patient tables under `tables/`.
+`figures/make_dataset_figures.py` turns those tables into the paper's F1–F4
+figures (and F6/F7 if stages 7/9 were run) and does not itself need a GPU.
 
 ---
 
 ## Baselines
 
 ```bash
-python src/run_baselines.py                  # per-patient metrics on the test split
-python src/figures/make_baseline_figures.py
+python src/run_baselines.py --data /path/to/victre-paired --out ./paper --split test
+python src/figures/make_baseline_figures.py --out ./paper
 ```
 
 `run_baselines.py` reconstructs every test patient with **nine** classical
 methods (FBP; Aᵀp; SIRT-20/50/100; SART-2/4/8; ASD-POCS-20) under **both**
-regimes.
+regimes and writes per-patient rows to `paper/tables/baseline_raw.csv`; it
+needs a GPU and is resumable (safe to interrupt and re-run). It does not
+itself produce tables or figures.
+
+`figures/make_baseline_figures.py` reads that CSV and writes `paper/tables/`
+(`baseline_summary.csv`, `inversion_stats.json`, `T3_baseline.tex`/`.md`) and
+`paper/figures/` (`F5_two_regime`, `F5b_density`, `F5c_task_sdnr`, and, if you
+pass `--data`, the `F6_gallery_*` reconstruction gallery). This step needs no
+GPU except for the optional F6 gallery.
 
 FBP is implemented from scratch (Hann-windowed ramp filter, edge-replicate
 padding, approximate cosine weighting) rather than adapted from VICTRE's own
