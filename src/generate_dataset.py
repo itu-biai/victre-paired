@@ -1,340 +1,490 @@
+#!/usr/bin/env python3
 """
-generate_dataset.py — build the VICTRE-PAIRED v6 dataset from VICTRE source data.
+VICTRE-Paired — dataset generation.
 
-For every eligible VICTRE patient this script produces a paired sample:
-  * clean_proj        — the 25 limited-angle Monte-Carlo projections, flat-field
-                        corrected, penumbra-cleaned, downsampled, normalized and
-                        density-aligned;
-  * noisy_proj{,_full,_quarter} — Poisson-Gaussian noisy projections at three
-                        dose levels (half dose is the default `noisy_proj`);
-  * clean, noisy, mask — the paired FBP reconstruction volume (reference),
-                        a noisy reconstruction, and the breast mask;
-  * lesion_coords     — phantom-accurate lesion locations mapped into the
-                        reconstruction grid, with lesion type;
-  * per-sample metadata (seed, density, native_z, scale factors, sigmas ...).
+Builds paired projection/reconstruction chunks from the VICTRE in-silico trial
+source data (Badano et al., 2018;
+https://www.cancerimagingarchive.net/collection/victre/).
 
-Samples are written in chunks of 8 patients as compressed .npz files, split
-deterministically into train/val/test.
+This script assumes the VICTRE source data is already on disk:
+  - `projections/<SEED>/<UID>/*.dcm`   25 raw Monte-Carlo projection DICOMs/patient
+  - `dicoms_v2/<UID>/*.dcm`            the corresponding FBP reconstruction slices
+  - `manifest.csv`                     SEED -> SeriesInstanceUID mapping
+  - lesion `.loc` files                from https://github.com/DIDSR/VICTRE (Locations/)
+  - a flat-field estimate              `flatfield/coefficients.json` +
+                                        `flatfield/valley.json` — see
+                                        docs/flatfield_estimation.md. The true VICTRE
+                                        flat-field is not published; this repository
+                                        estimates one per density class from air-only
+                                        detector regions (paper, Methods).
 
-USAGE (designed for parallel execution across five Google Colab sessions):
-    Set RUN_MODE to one of {"train_1","train_2","train_3","val","test"} and run.
-    The train split is produced in three parallel shards. Completed chunks are
-    skipped, so an interrupted run can simply be restarted.
+Runs on CPU — no GPU/LEAP needed for generation (only for validate_dataset.py and
+run_baselines.py). Safe to interrupt and resume: each chunk is written to a local
+temp file, copied to the output directory under a temp name, then atomically
+renamed; already-complete chunks are skipped on the next run.
 
-INPUTS (expected under a Google Drive mount; adapt paths as needed):
-    VICTRE/projections/<seed>/<series>/*.dcm     raw MC projection DICOMs
-    VICTRE/dicoms_v2/<uid>/*.dcm                  FBP reconstruction DICOMs
-    VICTRE/dicoms_v2/manifest.csv                 SEED <-> series UID manifest
-    ff_poly2_25.npy                               estimated flat-field (see paper)
-    Lesion .loc files are fetched from github.com/DIDSR/VICTRE on first run.
+Usage
+-----
+    python generate_dataset.py --split train --shard 0 --n-shards 3
+    python generate_dataset.py --split val
+    python generate_dataset.py --split test
+    python generate_dataset.py --split test --dry-run 3     # smoke test, no writes
 
-This is the exact production logic used for the released dataset; only comments
-and messages have been translated and documentation added.
+For a large train split, shard the work across parallel processes/machines with
+--shard i --n-shards N (every i-th patient, by sorted seed, modulo N). This is a
+parallelism convenience only; split membership never depends on the shard count.
 """
-import os
-import re
-import glob
-import time
-import random
-import shutil
-import subprocess
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import os, sys, glob, json, re, gc, time, argparse, shutil
 
 import numpy as np
-import torch
-import torch.nn.functional as F
 import pandas as pd
-import pydicom
+import torch
+import torch.nn.functional as Fn
 from scipy.ndimage import binary_dilation
 
-from constants import (
-    DS, RECON_Z as ZOUT, NA, RECON_H as Hr, RECON_W as Wr,
-    PROJ_ROWS as Hp, PROJ_COLS as Wp, VALLEY, DILATE, OFFSET,
-    DOSES, S_ELEC, SEED_SPLIT, CHUNK, SPLIT, fmt_seconds as fmt,
-)
+try:
+    import pydicom
+except ImportError:
+    raise SystemExit("pip install pydicom")
 
-# ── 🚨 CHANGE THIS IN EACH PARALLEL SESSION ────────────────────────────────
-RUN_MODE = "train_1"    # one of: "train_1" | "train_2" | "train_3" | "val" | "test"
-# ───────────────────────────────────────────────────────────────────────────
+from constants import (ZOUT, TH, TW, NA, PH, PW, SID, SDD, DET_PIX, VOX_XY,
+                       NATIVE_PIX, OFFX_C, OFFY_A, OFFY_B, DELTA, NATIVE_XY,
+                       DOSES, S_ELEC, MASK_THR)
+# ANG and the trajectory itself are used by geometry.py at reconstruction time,
+# not during generation; DOSE_IDX is implicit in enumerate(DOSES.items()) below
+# (dose_idx 0/1/2 for full/half/quarter, matching constants.DOSE_IDX).
 
-ROOT = Path("/content/drive/MyDrive/New_DBT/VICTRE")
-PROJD, REKON = ROOT / "projections", ROOT / "dicoms_v2"
-OUT = Path("/content/drive/MyDrive/New_DBT/VICTRE-PAIRED-v6")
-LOCAL = Path("/content/v6"); LOCAL.mkdir(exist_ok=True)
-REPO, LOCEXT = "/content/VICTRE_repo", "/content/VICTRE_repo/Locations/ext"
-FF2 = "/content/drive/MyDrive/New_DBT/ff_poly2_25.npy"
+DS = 4              # native -> stored downsample factor
+CHUNK = 8            # patients per .npz
+AIR_THR = 5000       # raw detector counts above which a pixel is "illuminated"
 
+# =============================================================================
+# CONFIG — edit paths for your environment
+# =============================================================================
+SOURCE_ROOT   = "/data/VICTRE"                    # projections/, dicoms_v2/, manifest.csv
+LOC_ROOT      = "/data/VICTRE/Locations/ext"       # extracted DIDSR/VICTRE Locations/*.tar.gz
+FLATFIELD_DIR = "/data/VICTRE/flatfield"           # coefficients.json, valley.json
+OUTPUT_ROOT   = "/data/victre-paired"              # where train/val/test chunks are written
+SPLIT_SOURCE  = None                                # optional: existing dataset to read the
+                                                     # split assignment from (keeps membership
+                                                     # stable across regenerations); None ->
+                                                     # derive a fresh deterministic split
+LOCAL_TMP     = "/tmp/victre_paired_build"
+os.makedirs(LOCAL_TMP, exist_ok=True)
 
-def key_of(s):
-    """Canonical patient key: SEED string without a leading sign."""
-    return str(s).lstrip('-')
+ap = argparse.ArgumentParser()
+ap.add_argument("--split", required=True, choices=["train", "val", "test"])
+ap.add_argument("--shard", type=int, default=0)
+ap.add_argument("--n-shards", type=int, default=1)
+ap.add_argument("--dry-run", type=int, default=0,
+                help="process only this many patients, write to a scratch subfolder")
+ap.add_argument("--force", action="store_true", help="reprocess already-complete chunks")
+ap.add_argument("--selfcheck-every", type=int, default=25)
+args = ap.parse_args()
 
+OUT = os.path.join(OUTPUT_ROOT, "_dry_run") if args.dry_run else OUTPUT_ROOT
+os.makedirs(os.path.join(OUT, args.split), exist_ok=True)
 
-# ── PREPARATION: fetch lesion .loc files + check flat-field ────────────────
-print(f"[{RUN_MODE}] Preparing...", flush=True)
-if not os.path.isdir(LOCEXT) or not glob.glob(f"{LOCEXT}/**/*.loc", recursive=True):
-    print("  .loc missing -> downloading from GitHub...", flush=True)
-    if not os.path.isdir(REPO):
-        subprocess.run(f"git clone --depth 1 https://github.com/DIDSR/VICTRE.git {REPO}",
-                       shell=True, check=True)
-    os.makedirs(LOCEXT, exist_ok=True)
-    for f in glob.glob(f"{REPO}/Locations/DBT-*.tar.gz"):
-        subprocess.run(f'tar -xzf "{f}" -C "{LOCEXT}"', shell=True, check=True)
-nloc = len(glob.glob(f"{LOCEXT}/**/*.loc", recursive=True))
-print(f"  .loc files: {nloc} {'OK' if nloc == 2994 else 'WARN'}", flush=True)
-assert nloc > 2900, "ERROR: lesion .loc files missing"
-assert os.path.exists(FF2), f"ERROR: flat-field not found: {FF2}"
-ff2 = np.load(FF2)
-print(f"  flat-field: {ff2.shape} OK", flush=True)
+T0 = time.time()
+def P(*a): print(" ".join(str(x) for x in a), flush=True)
+def hdr(t): P("\n" + "=" * 78); P(f"{t}  [{(time.time()-T0)/60:.0f} min]"); P("=" * 78)
 
-# ── SEED maps (SEED -> lesion file / signal-present / density / recon UID) ──
-s2loc, s2pos, s2dens = {}, {}, {}
-for p in glob.glob(f"{LOCEXT}/**/*.loc", recursive=True):
-    m = re.match(r'roi_(SP|SA)_(-?\d+)\.loc', os.path.basename(p))
-    if m:
-        k = key_of(m.group(2))
-        s2loc[k] = p
-        s2pos[k] = (m.group(1) == 'SP')          # SP = signal-present, SA = signal-absent
-        s2dens[k] = p.split('/DBT-')[1].split('/')[0]
-man = pd.read_csv(str(REKON / "manifest.csv"))
-man["_k"] = man["PatientID"].astype(str).map(key_of)
-rm = man[man["SeriesDescription"].astype(str).str.contains("slice|DBT|recon", case=False, na=False)]
-s2uid = dict(zip(rm["_k"], rm["SeriesInstanceUID"].astype(str)))
-print(f"  SEEDs: {len(s2loc)} | signal-present={sum(s2pos.values())} | recon UIDs={len(s2uid)}\n",
-      flush=True)
+P(f"{'#'*78}\nVICTRE-Paired generation  split={args.split} shard={args.shard}/"
+  f"{args.n_shards}{'  *** DRY RUN ***' if args.dry_run else ''}\n{'#'*78}")
 
+# =============================================================================
+# Flat-field (per-density polynomial correction + penumbra-strip threshold)
+# =============================================================================
+hdr("Flat-field")
+coef_path   = os.path.join(FLATFIELD_DIR, "coefficients.json")
+valley_path = os.path.join(FLATFIELD_DIR, "valley.json")
+if not (os.path.exists(coef_path) and os.path.exists(valley_path)):
+    sys.exit(f"Missing {coef_path} or {valley_path}. Build them first — see "
+             f"docs/flatfield_estimation.md.")
+COEF   = json.load(open(coef_path))
+VALLEY = json.load(open(valley_path))
+P("valley thresholds: " + ", ".join(f"{d}={v:.3f}" for d, v in VALLEY.items()))
 
-# ── HELPER FUNCTIONS ───────────────────────────────────────────────────────
-def ds2(x):
-    """4x average-pool spatial downsampling of a 2-D array."""
-    return F.avg_pool2d(torch.from_numpy(x)[None, None].float(), DS)[0, 0].numpy()
+# native (pre-downsample) detector shape, from the VICTRE source geometry
+NATIVE_DET_H, NATIVE_DET_W = 3000, 1500
+_rr, _cc = np.meshgrid(np.arange(NATIVE_DET_H) / NATIVE_DET_H,
+                       np.arange(NATIVE_DET_W) / NATIVE_DET_W, indexing="ij")
+FF_BASE_PATH = os.path.join(FLATFIELD_DIR, "ff_base.npy")
+if not os.path.exists(FF_BASE_PATH):
+    sys.exit(f"Missing {FF_BASE_PATH} — the per-view maximum-projection base flat-field "
+             f"(see docs/flatfield_estimation.md, step 1).")
+FF_BASE = np.load(FF_BASE_PATH).astype(np.float32)   # (NA, 3000, 1500)
 
+_ff_cache = {}
+def build_flatfield(density):
+    """Per-density polynomial correction applied to the base flat-field."""
+    if density in _ff_cache:
+        return _ff_cache[density]
+    out = np.empty((NA, NATIVE_DET_H, NATIVE_DET_W), np.float32)
+    for c in COEF[density]:
+        view, b, deg = c["view"], np.array(c["coef"]), c["deg"]
+        terms = [np.ones_like(_rr), _rr, _cc, _rr*_rr, _rr*_cc, _cc*_cc]
+        if deg >= 3:
+            terms += [_rr**3, _rr*_rr*_cc, _rr*_cc*_cc, _cc**3]
+        out[view] = FF_BASE[view] * np.clip(sum(bi*ti for bi, ti in zip(b, terms)), 0.2, 3.0)
+    _ff_cache[density] = out
+    return out
 
-def fit(a, TH, TW, pad=0.0):
-    """Crop or pad the last two dims of `a` to exactly (TH, TW)."""
-    a = a[..., :min(a.shape[-2], TH), :min(a.shape[-1], TW)]
-    h, w = a.shape[-2:]
-    if h < TH or w < TW:
-        a = np.pad(a, [(0, 0)] * (a.ndim - 2) + [(0, TH - h), (0, TW - w)], constant_values=pad)
+# =============================================================================
+# Source index: .loc files, manifest -> seed -> (loc path, is_positive, density, UID)
+# =============================================================================
+hdr("Indexing source data")
+loc_files = glob.glob(f"{LOC_ROOT}/**/*.loc", recursive=True)
+if not loc_files:
+    sys.exit(f"No .loc files under {LOC_ROOT}. Clone https://github.com/DIDSR/VICTRE "
+             f"and extract Locations/DBT-*.tar.gz there.")
+
+def key_of(seed):
+    return str(seed).lstrip("-")
+
+seed2loc, seed2pos, seed2density = {}, {}, {}
+for p in loc_files:
+    m = re.match(r"roi_(SP|SA)_(-?\d+)\.loc", os.path.basename(p))
+    if not m:
+        continue
+    k = key_of(m.group(2))
+    seed2loc[k] = p
+    seed2pos[k] = (m.group(1) == "SP")          # SP = signal-present, SA = signal-absent
+    seed2density[k] = p.split("/DBT-")[1].split("/")[0]
+
+manifest = pd.read_csv(os.path.join(SOURCE_ROOT, "manifest.csv"))
+manifest["_k"] = manifest["PatientID"].astype(str).map(key_of)
+recon_rows = manifest[manifest["SeriesDescription"].astype(str)
+                      .str.contains("slice|DBT|recon", case=False, na=False)]
+seed2uid = dict(zip(recon_rows["_k"], recon_rows["SeriesInstanceUID"].astype(str)))
+P(f"  patients with .loc: {len(seed2loc)}  SP: {sum(seed2pos.values())}  "
+  f"recon UID: {len(seed2uid)}")
+
+# =============================================================================
+# Split assignment
+# =============================================================================
+hdr("Split")
+if SPLIT_SOURCE:
+    seed2split = {}
+    for sp in ["train", "val", "test"]:
+        for f in sorted(glob.glob(f"{SPLIT_SOURCE}/{sp}/*.npz")):
+            d = np.load(f)
+            for s in d["seed"]:
+                seed2split[int(s)] = sp
+            d.close()
+    P(f"  read from {SPLIT_SOURCE}: "
+      f"{ {sp: sum(1 for v in seed2split.values() if v == sp) for sp in ['train','val','test']} }")
+else:
+    # Deterministic 80/10/10 split by seed hash, stable across re-runs.
+    import hashlib
+    def split_of(seed):
+        h = int(hashlib.sha256(str(seed).encode()).hexdigest(), 16) % 100
+        return "train" if h < 80 else ("val" if h < 90 else "test")
+    seed2split = {int(k): split_of(k) for k in seed2loc}
+    P(f"  derived: { {sp: sum(1 for v in seed2split.values() if v == sp) for sp in ['train','val','test']} }")
+
+seeds_in_split = sorted(s for s, sp in seed2split.items() if sp == args.split)
+seeds_mine = [s for i, s in enumerate(seeds_in_split) if i % args.n_shards == args.shard]
+P(f"  {args.split}: {len(seeds_in_split)} total, {len(seeds_mine)} in this shard "
+  f"({args.shard}/{args.n_shards})")
+if args.dry_run:
+    seeds_mine = seeds_mine[:args.dry_run]
+    P(f"  dry-run: first {len(seeds_mine)} patients only, writing to {OUT}")
+
+ITEMS = [(s, key_of(s), seed2uid[key_of(s)], seed2density[key_of(s)])
+         for s in seeds_mine
+         if key_of(s) in seed2loc and key_of(s) in seed2uid and key_of(s) in seed2density]
+P(f"  valid (loc + uid + density present): {len(ITEMS)}/{len(seeds_mine)}")
+
+# =============================================================================
+# Core loaders
+# =============================================================================
+def downsample(x):
+    return Fn.avg_pool2d(torch.from_numpy(x)[None, None].float(), DS)[0, 0].numpy()
+
+def fit_to(a, h, w, pad=0.0):
+    a = a[..., :min(a.shape[-2], h), :min(a.shape[-1], w)]
+    hh, ww = a.shape[-2:]
+    if hh < h or ww < w:
+        a = np.pad(a, [(0, 0)]*(a.ndim - 2) + [(0, h - hh), (0, w - ww)], constant_values=pad)
     return a
 
+def projection_files(seed):
+    fs = sorted(glob.glob(f"{SOURCE_ROOT}/projections/{seed}/*/*.dcm"),
+               key=lambda p: int(pydicom.dcmread(p, stop_before_pixels=True).InstanceNumber))
+    return fs if len(fs) == NA else None
 
-def shift2d(img, dr, dc):
-    """Integer-pixel shift of a 2-D image by (dr, dc) with zero fill.
-    Used instead of np.roll so content does not wrap around the edges."""
-    o = np.zeros_like(img)
-    h, w = img.shape
-    yd = slice(max(0, dr), h - max(0, -dr)); ys = slice(max(0, -dr), h - max(0, dr))
-    xd = slice(max(0, dc), w - max(0, -dc)); xs = slice(max(0, -dc), w - max(0, dc))
-    o[yd, xd] = img[ys, xs]
-    return o
+def load_projections(seed, density):
+    """Real MC projections -> flat-field-corrected log-attenuation, NOT shifted.
 
-
-def load_proj(seed, dens):
-    """Load and process the 25 MC projections for one patient.
-
-    Steps: read DICOMs in acquisition order; convert to attenuation via
-    p = log(flatfield) - log(intensity); restrict to the air bounding box;
-    remove the penumbra strip (attenuation above VALLEY); downsample; normalize
-    by the 99.8th percentile; crop/pad to (25, Hp, Wp); density-align each view.
-    Returns (projections, normalization_scale) or (None, None) on failure.
+    Mirrors the source pixel array through: illuminated-region bounding box,
+    log(flatfield) - log(I) attenuation, penumbra-strip removal (values above
+    the per-density valley threshold), 4x downsample, 99.8-percentile
+    normalization. No empirical alignment shift is applied — the projection
+    geometry needed to relate this to `clean` is written per patient instead
+    (see geom_for below / geom_* fields).
     """
-    fs = sorted(glob.glob(f'{PROJD}/{seed}/*/*.dcm'),
-                key=lambda p: int(pydicom.dcmread(p, stop_before_pixels=True).InstanceNumber))
-    if len(fs) != NA:
+    files = projection_files(seed)
+    if files is None:
         return None, None
-    out = []
-    for a, f in enumerate(fs):
+    ff = build_flatfield(density)
+    valley = VALLEY[density]
+    views = []
+    for view, f in enumerate(files):
         I = pydicom.dcmread(f).pixel_array.astype(np.float32)
-        air = I > 5000
-        ys, xs = np.where(air)
+        illuminated = I > AIR_THR
+        ys, xs = np.where(illuminated)
         if len(ys) == 0:
             return None, None
-        m = np.zeros_like(air)
-        m[ys.min():ys.max() + 1, xs.min():xs.max() + 1] = True
-        p = np.clip(np.log(ff2[a]) - np.log(np.clip(I, 1, None)), 0, None)
-        p = np.where(m, p, 0.0)
-        bad = binary_dilation(p > VALLEY, iterations=DILATE)          # penumbra strip
-        out.append(ds2(np.where(bad, 0.0, p)))
-    out = np.stack(out)
-    nz = out[out > 0]
-    if nz.size == 0:
+        bbox = np.zeros_like(illuminated)
+        bbox[ys.min():ys.max()+1, xs.min():xs.max()+1] = True
+        p = np.clip(np.log(ff[view]) - np.log(np.clip(I, 1, None)), 0, None)
+        p = np.where(bbox, p, 0.0)
+        strip = binary_dilation(p > valley, iterations=1)     # penumbra strip + 1px margin
+        views.append(downsample(np.where(strip, 0.0, p)))
+        del I
+    views = np.stack(views)
+    nonzero = views[views > 0]
+    if nonzero.size == 0:
         return None, None
-    q = float(np.percentile(nz, 99.8) + 1e-6)
-    out = fit(np.clip(out / q, 0, 1), Hp, Wp)
-    sl, ic, co = OFFSET.get(dens, OFFSET["scattered"])
-    aligned = np.stack([shift2d(out[a], int(round(sl * a + ic)), co) for a in range(NA)])
-    return aligned.astype(np.float32), q
+    scale = float(np.percentile(nonzero, 99.8) + 1e-6)
+    views = fit_to(np.clip(views / scale, 0, 1), PH, PW)
+    return views.astype(np.float32), scale
 
+def load_reconstruction(uid):
+    """FBP reconstruction volume -> resampled to ZOUT slices, 99.5-pct normalized."""
+    files = list(glob.glob(f"{SOURCE_ROOT}/dicoms_v2/{uid}/*.dcm"))
+    slices = sorted([(int(pydicom.dcmread(f, stop_before_pixels=True).InstanceNumber),
+                      pydicom.dcmread(f).pixel_array.astype(np.float32)) for f in files],
+                    key=lambda x: x[0])
+    volume = np.stack([downsample(img) for _, img in slices])
+    native_z = len(slices)
+    t = torch.from_numpy(volume)[None, None]
+    t = Fn.interpolate(t, size=(ZOUT, volume.shape[1], volume.shape[2]),
+                       mode="trilinear", align_corners=False)[0, 0].numpy()
+    scale = float(np.percentile(t, 99.5) + 1e-3)
+    return fit_to(np.clip(t / scale, 0, 1).astype(np.float32), TH, TW), native_z, scale
 
-def load_recon(uid):
-    """Load the FBP reconstruction volume for one series UID.
-
-    Reads slices in InstanceNumber order, downsamples in-plane, resamples the
-    slice axis to ZOUT via trilinear interpolation, normalizes by the 99.5th
-    percentile and crops/pads to (ZOUT, Hr, Wr). Returns (volume, native_z, scale).
-    """
-    fs = list((REKON / uid).glob("*.dcm"))
-    res = sorted([(int(pydicom.dcmread(str(f), stop_before_pixels=True).InstanceNumber),
-                   pydicom.dcmread(str(f)).pixel_array.astype(np.float32)) for f in fs],
-                 key=lambda x: x[0])
-    vol = np.stack([ds2(I) for _, I in res])
-    nz = len(res)
-    v = torch.from_numpy(vol)[None, None]
-    v = F.interpolate(v, size=(ZOUT, vol.shape[1], vol.shape[2]),
-                      mode="trilinear", align_corners=False)[0, 0].numpy()
-    q = float(np.percentile(v, 99.5) + 1e-3)
-    return fit(np.clip(v / q, 0, 1).astype(np.float32), Hr, Wr), nz, q
-
-
-def load_lesions(k, nz):
-    """Map phantom lesion locations into the reconstruction grid.
-
-    VICTRE .loc gives (X, Y, Z, type) in native coordinates; here X,Y are
-    downsampled by DS and Z is rescaled from the native slice count to ZOUT.
-    Only signal-present patients have lesions. Returns an (n, 4) array
-    [z, h, w, type], empty if none in range.
-    """
-    p = s2loc.get(k)
-    if p is None or not s2pos.get(k, False):
+def load_lesions(key, native_z):
+    """Lesion coordinates for signal-present (SP) patients only."""
+    if not seed2pos.get(key, False):
         return np.zeros((0, 4), np.float32)
-    loc = np.loadtxt(p)
+    path = seed2loc.get(key)
+    if path is None:
+        return np.zeros((0, 4), np.float32)
+    loc = np.loadtxt(path)
     if loc.size == 0:
         return np.zeros((0, 4), np.float32)
     if loc.ndim == 1:
         loc = loc[None]
-    o = [[Z * ZOUT / nz, X / DS, Y / DS, t] for X, Y, Z, t in loc
-         if 0 <= Z * ZOUT / nz < ZOUT and 0 <= X / DS < Hr and 0 <= Y / DS < Wr]
-    return np.array(o, np.float32) if o else np.zeros((0, 4), np.float32)
+    rows = [[Z*ZOUT/native_z, X/DS, Y/DS, t] for X, Y, Z, t in loc
+            if 0 <= Z*ZOUT/native_z < ZOUT and 0 <= X/DS < TH and 0 <= Y/DS < TW]
+    return np.array(rows, np.float32) if rows else np.zeros((0, 4), np.float32)
 
+def load_control_rois(key, native_z, max_rois=12):
+    """Matched signal-absent control regions for SA (is_pos=False) patients only."""
+    if seed2pos.get(key, True):
+        return np.zeros((0, 5), np.float32)
+    path = seed2loc.get(key)
+    if path is None:
+        return np.zeros((0, 5), np.float32)
+    loc = np.loadtxt(path)
+    if loc.size == 0:
+        return np.zeros((0, 5), np.float32)
+    if loc.ndim == 1:
+        loc = loc[None]
+    rows = []
+    for X, Y, Z, roi_id in loc:
+        z, h, w = Z*ZOUT/native_z, X/DS, Y/DS
+        in_bounds = (0 <= z < ZOUT and 0 <= h < TH and 0 <= w < TW)
+        rows.append([z, h, w, roi_id, float(in_bounds)])
+    return np.array(rows[:max_rois], np.float32) if rows else np.zeros((0, 5), np.float32)
 
-def add_noise(arr, a, s, rng):
-    """Apply the Poisson-Gaussian dose model at gain `a` and electronic std `s`.
-    Returns the noisy array (clipped to [0,1]) and the measured masked noise std."""
-    o = rng.poisson(np.maximum(arr / (a + 1e-8), 1e-6)).astype(np.float32) * a \
-        + rng.standard_normal(arr.shape).astype(np.float32) * s
-    o = np.clip(o, 0, 1).astype(np.float32)
-    m = arr > 0
-    return o, float((o[m] - arr[m]).std()) if m.any() else float(s)
+def add_noise(p, proj_scale, gain, seed, dose_idx):
+    """Intensity-domain Poisson + electronic noise, per-patient-per-dose seed."""
+    rng = np.random.default_rng(np.uint64(seed) * 10 + np.uint64(dose_idx))
+    I0 = 1.0 / gain
+    I  = I0 * np.exp(-np.clip(p, 0, 1) * proj_scale)
+    N  = rng.poisson(np.maximum(I, 1e-9)).astype(np.float64)
+    N += rng.standard_normal(p.shape) * (S_ELEC * I0 * 0.02)
+    return np.clip(-np.log(np.maximum(N, 1e-9) / I0) / proj_scale, 0, 1).astype(np.float32)
 
+def to_uint16(a):
+    return np.round(np.clip(a, 0, 1) * 65535).astype(np.uint16)
 
-# ── SCAN: find eligible patients (metadata-only, parallel I/O) ─────────────
-print(f"[{RUN_MODE}] Scanning (metadata-only)...", flush=True)
-pdirs = sorted([d for d in PROJD.iterdir() if d.is_dir()])
+def geometry_for(density, native_z):
+    """Per-patient LEAP volume placement — see constants.py for the derivation."""
+    nx, ny = NATIVE_XY[density]
+    vox_z = native_z / ZOUT
+    offx = (TH * VOX_XY - nx * NATIVE_PIX) / 2.0 + OFFX_C
+    offy = OFFY_A + OFFY_B * ny
+    offz = -(SDD - SID) + (ZOUT * vox_z) / 2.0 + DELTA[density]
+    return vox_z, offx, offy, offz
 
-
-def scan(pd_):
-    """Return (key, recon_uid) if the patient has 25 projections and a
-    reconstruction series present on disk, else None."""
-    try:
-        k = key_of(pd_.name)
-        if k not in s2loc:
-            return None
-        uid = s2uid.get(k)
-        if uid is None or not (REKON / uid).exists():
-            return None
-        sers = [d for d in pd_.iterdir() if d.is_dir()]
-        if not sers or len(list(sers[0].glob("*.dcm"))) != NA:
-            return None
-        if not list((REKON / uid).glob("*.dcm")):
-            return None
-        return (k, uid)
-    except Exception:
-        return None
-
-
-res = [None] * len(pdirs)
-t0 = time.time()
-dn = 0
-with ThreadPoolExecutor(max_workers=16) as ex:
-    fut = {ex.submit(scan, pdirs[i]): i for i in range(len(pdirs))}
-    for f in as_completed(fut):
-        res[fut[f]] = f.result()
-        dn += 1
-        if dn % 500 == 0:
-            print(f"  {dn}/{len(pdirs)} | {fmt(time.time() - t0)}", flush=True)
-pts = [r for r in res if r]
-print(f"[{RUN_MODE}] eligible patients: {len(pts)} (2761 expected)", flush=True)
-assert len(pts) > 2700, f"WARN: too few ({len(pts)}) — stopping"
-
-# ── SPLIT (deterministic; train produced in three shards) ──────────────────
-random.Random(SEED_SPLIT).shuffle(pts)
-n = len(pts)
-nt = int(n * SPLIT["train"]); nv = int(n * SPLIT["val"])
-tr = pts[:nt]; ps = len(tr) // 3
-TASKS = {"train_1": ("train", tr[:ps]), "train_2": ("train", tr[ps:2 * ps]),
-         "train_3": ("train", tr[2 * ps:]), "val": ("val", pts[nt:nt + nv]),
-         "test": ("test", pts[nt + nv:])}
-split_name, items = TASKS[RUN_MODE]
-print(f"[{RUN_MODE}] {len(items)} patients to process\n", flush=True)
-
-# ── GENERATION ─────────────────────────────────────────────────────────────
-od = OUT / split_name
-od.mkdir(parents=True, exist_ok=True)
-rng = np.random.default_rng(SEED_SPLIT)
-buf = []; ci = 0; done = 0; skip = 0; t0 = time.time()
-
-
-def flush(buf, ci):
-    """Write one chunk of up to CHUNK patients as a compressed .npz.
-    Data is written locally first, then copied to Drive (FUSE-safe)."""
-    fn = f"{RUN_MODE}_chunk_{ci:05d}.npz"
-    lp = LOCAL / fn
+# =============================================================================
+# Chunk writer (atomic: local tmp -> copy to destination tmp name -> rename)
+# =============================================================================
+def write_chunk(buf, chunk_idx, split_name):
+    fname = f"{split_name}_chunk_{chunk_idx:05d}.npz"
+    local_path = os.path.join(LOCAL_TMP, fname)
     d = dict(
-        clean=np.stack([b["cv"] for b in buf]), noisy=np.stack([b["nv"] for b in buf]),
-        mask=np.stack([b["mk"] for b in buf]), is_pos=np.array([b["ip"] for b in buf], bool),
-        clean_proj=np.stack([b["cp"] for b in buf]),
-        seed=np.array([b["sd"] for b in buf]), density=np.array([b["dn"] for b in buf]),
-        native_z=np.array([b["nz"] for b in buf], np.int16),
-        lesion_coords=np.stack([b["les"] for b in buf]),
-        lesion_count=np.array([b["nl"] for b in buf], np.int16),
-        recon_scale=np.array([b["rq"] for b in buf], np.float32),
-        proj_scale=np.array([b["pq"] for b in buf], np.float32),
-        sigma_recon=np.array([b["sr"] for b in buf], np.float32),
-        dose_levels=np.array([1.0, 0.5, 0.25], np.float32),
+        clean=to_uint16(np.stack([b["clean"] for b in buf])),
+        clean_proj=to_uint16(np.stack([b["proj"] for b in buf])),
+        mask=np.stack([b["mask"] for b in buf]).astype(np.uint8),
+        is_pos=np.array([b["is_pos"] for b in buf], bool),
+        seed=np.array([b["seed"] for b in buf], np.int64),
+        density=np.array([b["density"] for b in buf]),
+        native_z=np.array([b["native_z"] for b in buf], np.int16),
+        native_x=np.array([b["native_x"] for b in buf], np.int16),
+        native_y=np.array([b["native_y"] for b in buf], np.int16),
+        lesion_coords=np.stack([b["lesions"] for b in buf]),
+        lesion_count=np.array([b["n_lesions"] for b in buf], np.int16),
+        control_rois=np.stack([b["controls"] for b in buf]),
+        control_count=np.array([b["n_controls"] for b in buf], np.int16),
+        recon_scale=np.array([b["recon_scale"] for b in buf], np.float32),
+        proj_scale=np.array([b["proj_scale"] for b in buf], np.float32),
+        noise_seed=np.array([b["seed"] for b in buf], np.int64),
+        geom_vox_z=np.array([b["vox_z"] for b in buf], np.float32),
+        geom_offx=np.array([b["offx"] for b in buf], np.float32),
+        geom_offy=np.array([b["offy"] for b in buf], np.float32),
+        geom_offz=np.array([b["offz"] for b in buf], np.float32),
+        strip_valley=np.array([b["valley"] for b in buf], np.float32),
+        dose_levels=np.array(["full", "half", "quarter"]),
         dose_gains=np.array([DOSES["full"], DOSES["half"], DOSES["quarter"]], np.float32),
-        elec_noise=np.float32(S_ELEC), strip_valley=np.float32(VALLEY))
+        elec_noise=np.float32(S_ELEC),
+        sid=np.float32(SID), sdd=np.float32(SDD), det_pix=np.float32(DET_PIX),
+    )
     for tag in DOSES:
-        key = "noisy_proj" if tag == "half" else f"noisy_proj_{tag}"
-        d[key] = np.stack([b["np_"][tag] for b in buf])
-        skey = "sigma" if tag == "half" else f"sigma_{tag}"
-        d[skey] = np.array([b["sg"][tag] for b in buf], np.float32)
-    np.savez_compressed(str(lp), **d)
-    shutil.copy2(str(lp), str(od / fn))
-    os.remove(str(lp))
+        proj_key  = "noisy_proj" if tag == "half" else f"noisy_proj_{tag}"
+        sigma_key = "sigma" if tag == "half" else f"sigma_{tag}"
+        d[proj_key]  = to_uint16(np.stack([b["noisy"][tag] for b in buf]))
+        d[sigma_key] = np.array([b["sigma"][tag] for b in buf], np.float32)
 
+    np.savez_compressed(local_path, **d)
+    final_path = os.path.join(OUT, split_name, fname)
+    os.makedirs(os.path.dirname(final_path), exist_ok=True)
+    tmp_dest = final_path + f".tmp{os.getpid()}"
+    shutil.copy2(local_path, tmp_dest)
+    os.replace(tmp_dest, final_path)          # atomic on the same filesystem
+    os.remove(local_path)
+    return final_path
 
-for k, uid in items:
-    if (od / f"{RUN_MODE}_chunk_{ci:05d}.npz").exists() and not buf:
-        ci += 1; done += CHUNK; continue                     # skip an already-complete chunk
+def chunk_exists(chunk_idx, split_name):
+    return os.path.exists(os.path.join(OUT, split_name, f"{split_name}_chunk_{chunk_idx:05d}.npz"))
+
+# =============================================================================
+# Main loop
+# =============================================================================
+hdr(f"Generating {len(ITEMS)} patients")
+split_name = args.split
+buf, chunk_idx, done, skipped, issues = [], 0, 0, 0, []
+t0 = time.time()
+
+for idx, (seed, key, uid, density) in enumerate(ITEMS):
+    if not args.force and not buf and chunk_exists(chunk_idx, split_name):
+        chunk_idx += 1
+        done += CHUNK
+        if done % (CHUNK * 20) == 0:
+            P(f"  [skip] already-complete chunks... ({done} patients)")
+        continue
     try:
-        dens = s2dens.get(k, "?")
-        cp, pq = load_proj(k, dens)
-        if cp is None:
-            skip += 1; continue
-        cv, nz, rq = load_recon(uid)
-        mk = (cv > 0.08).astype(np.float32)
-        nv, sr = add_noise(cv, DOSES["half"], S_ELEC, rng)
-        np_, sg = {}, {}
-        for tag, a in DOSES.items():
-            np_[tag], sg[tag] = add_noise(cp, a, S_ELEC, rng)
-        les = load_lesions(k, nz)
-        lp_ = np.zeros((8, 4), np.float32); nl = min(len(les), 8)
-        if nl:
-            lp_[:nl] = les[:nl]
-        buf.append(dict(cv=cv, nv=nv, mk=mk, ip=s2pos.get(k, False), cp=cp, np_=np_, sg=sg,
-                        sd=int(k), dn=dens, nz=nz, les=lp_, nl=nl, rq=rq, pq=pq, sr=sr))
-        done += 1
-    except Exception as e:
-        print(f"  error ({k}): {e}", flush=True); skip += 1; continue
-    if len(buf) >= CHUNK:
-        flush(buf, ci); buf = []; ci += 1
-        el = time.time() - t0
-        print(f"  [{RUN_MODE}] chunk {ci} | {done}/{len(items)} patients | skipped {skip} | "
-              f"{fmt(el)} | ETA ~{fmt(el / done * (len(items) - done))}", flush=True)
-if buf:
-    flush(buf, ci); ci += 1
+        proj, proj_scale = load_projections(seed, density)
+        if proj is None:
+            P(f"  ! {seed}: could not read projections / no air region, skipping")
+            skipped += 1
+            continue
+        clean, native_z, recon_scale = load_reconstruction(uid)
+        mask = (clean > MASK_THR)
 
-print(f"\n[{RUN_MODE}] DONE: {ci} chunks, {done} patients, {skip} skipped, {fmt(time.time() - t0)}",
-      flush=True)
+        lesions_raw = load_lesions(key, native_z)
+        lesions = np.zeros((8, 4), np.float32)
+        n_lesions = min(len(lesions_raw), 8)
+        if n_lesions:
+            lesions[:n_lesions] = lesions_raw[:n_lesions]
+
+        controls_raw = load_control_rois(key, native_z)
+        controls = np.zeros((12, 5), np.float32)
+        n_controls = min(len(controls_raw), 12)
+        if n_controls:
+            controls[:n_controls] = controls_raw[:n_controls]
+
+        noisy, sigma = {}, {}
+        for dose_idx, (tag, gain) in enumerate(DOSES.items()):
+            n = add_noise(proj, proj_scale, gain, seed, dose_idx)
+            noisy[tag] = n
+            support = proj > 0.02
+            sigma[tag] = float((n - proj)[support].std()) if support.any() else 0.0
+
+        vox_z, offx, offy, offz = geometry_for(density, native_z)
+        native_x, native_y = NATIVE_XY[density]
+
+        if args.selfcheck_every > 0 and idx % args.selfcheck_every == 0:
+            problems = []
+            if not np.all(np.isfinite(clean)): problems.append("clean_nan")
+            if not np.all(np.isfinite(proj)):  problems.append("clean_proj_nan")
+            if mask.sum() < 50: problems.append(f"mask_almost_empty({int(mask.sum())})")
+            if n_lesions > 0 and not np.all(lesions[n_lesions:] == 0):
+                problems.append("lesion_padding_wrong")
+            if n_controls > 0 and not np.all(controls[n_controls:] == 0):
+                problems.append("control_padding_wrong")
+            if problems:
+                issues.append(dict(seed=seed, density=density, problems=problems))
+                P(f"  ! self-check: seed={seed} -> {problems}")
+
+        buf.append(dict(clean=clean, proj=proj, mask=mask,
+                        is_pos=seed2pos.get(key, False), seed=int(seed), density=density,
+                        native_z=native_z, native_x=native_x, native_y=native_y,
+                        lesions=lesions, n_lesions=n_lesions,
+                        controls=controls, n_controls=n_controls,
+                        recon_scale=recon_scale, proj_scale=proj_scale,
+                        noisy=noisy, sigma=sigma,
+                        vox_z=vox_z, offx=offx, offy=offy, offz=offz,
+                        valley=VALLEY[density]))
+        done += 1
+        elapsed = time.time() - t0
+        rate = elapsed / max(1, done)
+        remaining = (len(ITEMS) - done - skipped) * rate
+        P(f"  [{done}/{len(ITEMS)}] seed={seed} {density:>12s} done | "
+          f"{elapsed/3600:.2f} h elapsed | ~{remaining/3600:.1f} h remaining | "
+          f"{rate:.0f} s/patient")
+    except Exception as e:
+        P(f"  ! ERROR seed={seed}: {type(e).__name__}: {e}")
+        issues.append(dict(seed=seed, density=density, problems=[f"exception:{e}"]))
+        skipped += 1
+        continue
+
+    if len(buf) >= CHUNK:
+        path = write_chunk(buf, chunk_idx, split_name)
+        P(f"  >>> chunk {chunk_idx} written -> {path}")
+        buf = []
+        chunk_idx += 1
+    gc.collect()
+
+if buf:
+    path = write_chunk(buf, chunk_idx, split_name)
+    P(f"  [final chunk {chunk_idx}] -> {path}  ({len(buf)} patients, partial)")
+    chunk_idx += 1
+
+hdr("Summary")
+P(f"  split: {split_name}{'  (dry run)' if args.dry_run else ''}")
+P(f"  processed: {done}  skipped: {skipped}  chunks written: {chunk_idx}")
+P(f"  total time: {(time.time()-T0)/3600:.2f} h")
+if issues:
+    P(f"\n  {len(issues)} patients flagged by self-check (data was written; review):")
+    for x in issues[:30]:
+        P(f"    seed={x['seed']} {x['density']}: {x['problems']}")
+    if len(issues) > 30:
+        P(f"    ... and {len(issues)-30} more")
+else:
+    P("\n  Self-check found no issues.")
+
+summary_path = os.path.join(OUT, f"generation_summary_{split_name}_shard{args.shard}.json")
+json.dump(dict(split=split_name, shard=args.shard, n_shards=args.n_shards,
+               processed=done, skipped=skipped, chunks=chunk_idx, issues=issues,
+               dry_run=bool(args.dry_run), hours=(time.time()-T0)/3600),
+          open(summary_path, "w"), indent=2, default=str)
+P(f"\n-> {summary_path}")
+if args.dry_run:
+    P(f"\n  This was a dry run. Nothing was written to {OUTPUT_ROOT}.")
+    P(f"  Inspect output under {OUT}/{split_name}/, then re-run without --dry-run.")
