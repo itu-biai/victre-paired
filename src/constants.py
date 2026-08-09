@@ -1,75 +1,98 @@
 """
-Shared constants for the VICTRE-PAIRED v6 pipeline.
+VICTRE-Paired — shared constants.
 
-All acquisition geometry, dose, alignment and split parameters used by the
-generation, validation and baseline scripts are defined here so that a single
-edit propagates everywhere and the released dataset is reproducible bit-for-bit
-given the same VICTRE source data.
-
-Geometry corresponds to the LEAP (LivermorE AI Projector) modular-beam model
-after 4x spatial downsampling of the VICTRE projections and reconstructions.
+Single source of truth for geometry, normalization, dose and split parameters.
+All values below are the ones actually used to produce the released dataset and
+are verified against every chunk by validate_dataset.py.
 """
 
-# ── Acquisition geometry (LEAP modular-beam, post-downsampling) ────────────
-SID = 630.0          # source-to-isocenter distance (mm)
-SDD = 650.0          # source-to-detector distance (mm)
-DET_PIX = 0.34       # detector pixel pitch (mm)
-NA = 25              # number of Monte-Carlo projection views
-ANGLE_DEG = 25.0     # half angular range; views span [-25 deg, +25 deg]
+# ---------------------------------------------------------------------------
+# Reconstruction volume (per patient, after downsampling)
+# ---------------------------------------------------------------------------
+ZOUT   = 56          # output slices (all patients resampled to 56)
+TH     = 408         # volume rows
+TW     = 336         # volume cols
+VOX_XY = 0.34        # in-plane voxel size [mm]  (= detector pixel after 4x)
 
-PROJ_ROWS = 752      # projection rows  (after downsampling)
-PROJ_COLS = 384      # projection cols  (after downsampling)
-RECON_Z = 56         # reconstruction slices (isotropic z-resample target)
-RECON_H = 408        # reconstruction height
-RECON_W = 336        # reconstruction width
-VOX_XY = 0.34        # in-plane voxel size (mm)
-VOX_Z = 1.0          # slice thickness (mm)
+# ---------------------------------------------------------------------------
+# Projection geometry (constant across the whole dataset)
+# ---------------------------------------------------------------------------
+NA      = 25         # number of views
+PH      = 752        # projection rows
+PW      = 384        # projection cols
+DET_PIX = 0.34       # detector pixel size [mm] (after 4x downsampling)
+ANG     = 25.0       # half angular range [deg]  → views span [-25, +25]
+SID     = 600.0      # source-to-isocenter distance [mm]
+SDD     = 650.0      # source-to-detector distance [mm]
 
-DS = 4               # spatial downsampling factor applied to VICTRE data
+# Native detector / reconstruction pixel of the VICTRE source (before 4x)
+NATIVE_PIX = 0.085   # [mm]
 
-# ── Dose / noise model ─────────────────────────────────────────────────────
-# Poisson gain per dose level; larger gain = fewer effective photons = noisier.
-DOSES = {"full": 0.001, "half": 0.002, "quarter": 0.004}
-S_ELEC = 0.010       # additive Gaussian electronic-noise std
-# `noisy_proj` (the default noisy projection array) is generated at HALF dose.
-
-# ── Density-dependent projection alignment offsets (empirical) ─────────────
-# (slope, intercept, column-shift): per-view row shift = slope*view + intercept,
-# with a constant column shift. Derived by maximizing agreement between the
-# real projections and the synthetic forward projection of the reconstruction.
-OFFSET = {
-    "scattered": (3.60, -70, 16),
-    "hetero":    (2.80, -96, 16),
-    "fatty":     (3.30, -40, 17),
-    "dense":     (2.10, -90, 16),
+# ---------------------------------------------------------------------------
+# Per-density native reconstruction dimensions (class-constant).
+# native_x = long axis (rows), native_y = short axis (cols), native_z = slices.
+# ---------------------------------------------------------------------------
+NATIVE_XY = {
+    "dense":     (1130, 477),
+    "hetero":    (1148, 753),
+    "scattered": (1421, 1024),
+    "fatty":     (1624, 1324),
 }
 
-# ── Penumbra strip removal ────────────────────────────────────────────────
-VALLEY = 3.22        # attenuation threshold marking the penumbra valley
-DILATE = 1           # binary-dilation iterations around the flagged strip
+# ---------------------------------------------------------------------------
+# Analytic volume placement for the LEAP modular-beam geometry.
+#
+#   geom_vox_z = native_z / ZOUT
+#   geom_offx  = (TH*VOX_XY - native_x*NATIVE_PIX)/2 + OFFX_C
+#   geom_offy  = OFFY_A + OFFY_B * native_y
+#   geom_offz  = -(SDD - SID) + ZOUT*geom_vox_z/2 + DELTA[density]
+#
+# These are stored per patient as geom_* fields; the constants below let you
+# rederive them and are the ones validate_dataset.py checks against.
+# ---------------------------------------------------------------------------
+OFFX_C = -0.203
+OFFY_A = -5.142
+OFFY_B = 0.0014214
 
-# ── Train / val / test split (deterministic) ──────────────────────────────
+# Per-density z-offset term. Tuned so that the residual parallax between
+# A(clean) and clean_proj is minimized on a held-out probe set.
+DELTA = {
+    "dense":     19.765,
+    "hetero":    20.242,
+    "scattered": 20.091,
+    "fatty":     20.807,
+}
+
+# ---------------------------------------------------------------------------
+# Normalization
+# ---------------------------------------------------------------------------
+P_RECON  = 99.5      # clean is normalized to this percentile = 1.0
+P_PROJ   = 99.8      # clean_proj is normalized to this percentile = 1.0
+MASK_THR = 0.08      # breast mask = clean > MASK_THR
+
+# ---------------------------------------------------------------------------
+# Noise / dose model (intensity domain)
+#
+#   I0 = 1/gain                              photon budget per pixel per view
+#   I  = I0 * exp(-clip(p,0,1) * proj_scale) transmitted photons
+#   N  ~ Poisson(I) + Normal(0, S_ELEC*I0*0.02)
+#   p_noisy = clip(-log(N/I0)/proj_scale, 0, 1)
+#
+# noise_seed = seed ; the rng is default_rng(noise_seed*10 + dose_idx).
+# dose_idx: 0 = full, 1 = half, 2 = quarter.
+# ---------------------------------------------------------------------------
+DOSES  = {"full": 0.001, "half": 0.002, "quarter": 0.004}   # gain per dose
+DOSE_IDX = {"full": 0, "half": 1, "quarter": 2}
+S_ELEC = 0.010       # electronic noise scale
+
+# ---------------------------------------------------------------------------
+# Split (read from the VICTRE source assignment, not re-shuffled)
+# ---------------------------------------------------------------------------
 SEED_SPLIT = 42
-SPLIT = {"train": 0.80, "val": 0.10, "test": 0.10}
-CHUNK = 8            # patients per .npz chunk
 
-# ── Reference metadata ─────────────────────────────────────────────────────
-# VICTRE reconstruction native slice count per breast density (before z-resample).
-NZMAP = {"dense": 38, "hetero": 47, "scattered": 57, "fatty": 62}
+# ---------------------------------------------------------------------------
+# Patients excluded from evaluation (kept in the dataset for completeness)
+# ---------------------------------------------------------------------------
+BROKEN_SEEDS = {208084664}   # degenerate VICTRE reconstruction
 
-# Expected split sizes for the released dataset (chunks, patients).
-EXPECT = {"train": (276, 2208), "val": (35, 276), "test": (35, 277)}
-N_PATIENTS_TOTAL = 2761
-
-# ── Known corrupt patient (VICTRE-sourced; documented, not removed) ────────
-# SEED 208084664 has a degenerate reconstruction (5 native slices, no depth
-# information). Kept in the release for completeness; exclude in evaluation.
-BROKEN_SEEDS = {208084664}
-
-
-def fmt_seconds(s):
-    """Human-readable H/M/S from a duration in seconds."""
-    s = int(s)
-    h, s = divmod(s, 3600)
-    m, s = divmod(s, 60)
-    return f"{h}h {m:02d}m {s:02d}s" if h else f"{m}m {s:02d}s"
+DENSITIES = ["dense", "hetero", "scattered", "fatty"]
