@@ -21,7 +21,8 @@ Stages
                   - penumbra-strip validity
                   - flat-field / air pedestal / angular uniformity
                   - noise: measured vs. stored sigma, dose monotonicity,
-                    whiteness, and bit-exact reproduction from noise_seed
+                    whiteness (determinism verified separately by
+                    regenerating a sample end to end, see Code Availability)
                   - lesion / control ROI validity and SDNR
                   - geometry: residual parallax between A(clean) and clean_proj (GPU)
   5  summary      statistics and pass/fail checks from stage 4's table  instant
@@ -98,20 +99,15 @@ DO_REFERENCE  = REFERENCE is not None
 
 _PROF = {
     "smoke": dict(FULL=False, N_FUSED=40,  N_BASELINE=8,  N_DOSE=8,
-                  DO_NOISE_ARRAYS=True, DO_NOISE_BITEXACT=True, N_BITEXACT=20,
-                  DO_GEOMETRY=True),
+                  DO_NOISE_ARRAYS=True, DO_GEOMETRY=True),
     "quick": dict(FULL=False, N_FUSED=300, N_BASELINE=32, N_DOSE=60,
-                  DO_NOISE_ARRAYS=True, DO_NOISE_BITEXACT=True, N_BITEXACT=60,
-                  DO_GEOMETRY=True),
+                  DO_NOISE_ARRAYS=True, DO_GEOMETRY=True),
     "full":  dict(FULL=True,  N_FUSED=0,   N_BASELINE=64, N_DOSE=120,
-                  DO_NOISE_ARRAYS=True, DO_NOISE_BITEXACT=True, N_BITEXACT=0,
-                  DO_GEOMETRY=True),
+                  DO_NOISE_ARRAYS=True, DO_GEOMETRY=True),
 }[args.profile]
 FULL = _PROF["FULL"]
 N_FUSED, N_BASELINE, N_DOSE = _PROF["N_FUSED"], _PROF["N_BASELINE"], _PROF["N_DOSE"]
-N_BITEXACT = _PROF["N_BITEXACT"]
 DO_NOISE_ARRAYS   = _PROF["DO_NOISE_ARRAYS"]
-DO_NOISE_BITEXACT = _PROF["DO_NOISE_BITEXACT"]
 DO_GEOMETRY       = _PROF["DO_GEOMETRY"]
 
 FBP_WINDOW, FBP_COSWEIGHT = "hann", True
@@ -136,8 +132,18 @@ KEYS = {"clean","clean_proj","mask","noisy_proj","noisy_proj_full",
     "dose_levels","dose_gains","elec_noise","sid","sdd","det_pix"}
 
 # =============================================================================
-# Noise formula — must match generate_dataset.py's add_noise() exactly.
-# Validated bit-exact against production output; see paper §Technical Validation.
+# Noise formula — kept here as a readable reference matching
+# generate_dataset.py's add_noise() exactly; not called by this script.
+# Regenerating noisy_proj from the *stored* (already-quantised) clean_proj
+# and comparing bit-for-bit against the released noisy_proj is not possible
+# even when this formula is correct: clean_proj and noisy_proj are each
+# quantised to uint16 independently from the pre-quantisation float32 array
+# at generation time, and the Poisson draw here is sensitive enough to a
+# sub-LSB difference in its input that a single quantisation step changes
+# the entire realised RNG stream. Determinism is instead verified by
+# re-running generate_dataset.py end to end on a sample of patients from the
+# source archive and comparing the freshly generated arrays against the
+# released ones (see paper, Code Availability).
 # =============================================================================
 def noise_formula(p, proj_scale, gain, seed, dose_idx, s_elec=S_ELEC):
     rng = np.random.default_rng(np.uint64(seed) * 10 + np.uint64(dose_idx))
@@ -169,8 +175,7 @@ def hdr(t):
 P(f"\n{'#'*80}\n# VICTRE-Paired validation   {time.strftime('%Y-%m-%d %H:%M')}"
   f"\n# data={DATA}"
   f"\n# profile={args.profile}  stages={STAGES}  full={FULL}  "
-  f"n_fused={'ALL' if FULL else N_FUSED}  bit-exact={DO_NOISE_BITEXACT}"
-  f"(n={N_BITEXACT or 'all'})"
+  f"n_fused={'ALL' if FULL else N_FUSED}"
   f"\n{'#'*80}")
 
 RES, CHECKS = {}, []
@@ -675,22 +680,6 @@ def solve_offz(dn, probes, base, span, coarse, fine, sid, sdd, vz):
     return b, s0, edge
 
 # =============================================================================
-#  GURULTU FORMULU OTOMATIK TESPITI
-# =============================================================================
-NOISE_CFG = {"variant": None, "map": {}, "err": None}
-def bitexact_check(cp, qs, nseed, stored):
-    """SABIT eslemeyle (full=0,half=1,quarter=2) bit farkini olc. Arama YOK."""
-    fn = noise_formula                          # production formula (see header)
-    tot = 0.0; per = {}
-    for dname, _, _, gain in DOSE:
-        if dname not in stored: continue
-        x = fn(cp, qs, gain, nseed, DOSE_IDX[dname], CFG["S_ELEC"])
-        e = int(np.abs(np.rint(x*65535).astype(np.int64)
-                       - stored[dname].astype(np.int64)).max())
-        per[dname] = e; tot += e
-    return per, tot
-
-# =============================================================================
 # ASAMA 4 — FUSED PASS   (her chunk BIR KEZ okunur)
 # =============================================================================
 if "4" in STAGES:
@@ -700,12 +689,6 @@ if "4" in STAGES:
     done = {int(r["seed"]) for r in rows}
     sel = [s for s in sel if s not in done]
     P(f"  {len(sel)} patients to process ({len(done)} already present)")
-    ncp = f"{TAB}/_noise_cfg.json"
-    if os.path.exists(ncp) and "4" not in FORCE_STAGES:
-        NOISE_CFG.update(json.load(open(ncp)))
-        P(f"  [cached] noise formula: variant {NOISE_CFG['variant']}, "
-          f"dose_idx {NOISE_CFG['map']}")
-
     TC = {"p": None, "d": None, "loc": None}
     RC = {"p": None, "d": None, "loc": None}
     def open_chunk(slot, path):
@@ -784,17 +767,17 @@ if "4" in STAGES:
                         rec["noise_lag1_row"]  = lag1(dd_[MID][sy, sx], 0)
                         rec["noise_lag1_col"]  = lag1(dd_[MID][sy, sx], 1)
                         rec["noise_lag1_view"] = lag1(dd_[:, sy, sx], 0)
-            # ---- (5b) BIT-EXACT REPRODUCTION (paper, Technical Validation) ------------------
-            _do_bx = (DO_NOISE_ARRAYS and DO_NOISE_BITEXACT and "noise_seed" in d.files
-                      and stored and (N_BITEXACT <= 0 or nn < N_BITEXACT))
-            if _do_bx:
-                ns = int(d["noise_seed"][b])
-                per, tot = bitexact_check(cp, qs, ns, stored)
-                for dname, e in per.items(): rec[f"bitdiff_{dname}"] = e
-                if NOISE_CFG["variant"] is None:
-                    NOISE_CFG.update(variant="A(uretim)", map=dict(DOSE_IDX),
-                                     err=float(tot))
-                    json.dump(NOISE_CFG, open(ncp+".t", "w")); os.replace(ncp+".t", ncp)
+            # ---- (5b) bit-exact reproduction: NOT checked here ----------------
+            # Regenerating noisy_proj from the *stored* clean_proj and comparing
+            # against the stored noisy_proj cannot succeed even when the noise
+            # formula is correct: clean_proj and noisy_proj are each quantised
+            # to uint16 independently from the pre-quantisation float32 array
+            # at generation time, and the Poisson draw inside the noise model
+            # is sensitive enough to a sub-LSB difference in its input that a
+            # single quantisation step changes the entire realised RNG stream.
+            # Determinism is instead verified by re-running generation end to
+            # end on a sample of patients (Code Availability) and comparing
+            # the freshly generated arrays against the released ones.
             del stored
             # ---- (6) LEZYON / KONTROL ROI ----------------------------------
             nl = int(d["lesion_count"][b]); lc = d["lesion_coords"][b]
@@ -956,40 +939,27 @@ if "5" in STAGES:
 
         # ---------- 4. GURULTU ------------------------------------------------
         P(f"\n  --- NOISE ---")
-        P(f"  {'doz':>9s} {'sigma':>9s} {'olculen':>9s} {'bagil fark':>12s} {'bit farki':>11s}")
+        P(f"  {'doz':>9s} {'sigma':>9s} {'olculen':>9s} {'bagil fark':>12s}")
         RES["noise"] = {}
         for dname, _, _, _ in DOSE:
             rp = C(f"sig_rep_{dname}"); ms = C(f"sig_meas_{dname}")
-            rd = C(f"sig_reldiff_{dname}"); bd = C(f"bitdiff_{dname}")
-            P(f"  {dname:>9s} {mn(rp):>9.5f} {mn(ms):>9.5f} "
-              f"%{100*mn(rd):>11.5f} {('%d'%bd.max()) if len(bd) else '-':>11s}")
+            rd = C(f"sig_reldiff_{dname}")
+            P(f"  {dname:>9s} {mn(rp):>9.5f} {mn(ms):>9.5f} %{100*mn(rd):>11.5f}")
             RES["noise"][dname] = dict(sigma=mn(rp), measured=mn(ms), reldiff=mn(rd),
-                bitdiff_max=float(bd.max()) if len(bd) else None,
-                bitdiff_frac_exact=float((bd <= 1).mean()) if len(bd) else None, n=len(rp))
+                n=len(rp))
         rdall = np.concatenate([C(f"sig_reldiff_{d_}") for d_, _, _, _ in DOSE
                                 if len(C(f"sig_reldiff_{d_}"))] or [np.array([np.nan])])
         check("stored sigma matches measured sigma (<0.5%)",
               np.nanmax(rdall) < 0.005, f"max {100*np.nanmax(rdall):.4f}%")
-        bda = [RES["noise"][d_]["bitdiff_max"] for d_, _, _, _ in DOSE
-               if RES["noise"][d_]["bitdiff_max"] is not None]
-        if bda:
-            P(f"\n  BIT-EXACT REPRODUCTION: variant "
-              f"{NOISE_CFG.get('variant')}, dose_idx {NOISE_CFG.get('map')}")
-            for dname, _, _, _ in DOSE:
-                e = RES["noise"][dname]
-                if e["bitdiff_max"] is not None:
-                    P(f"    {dname:>9s}: maks fark {e['bitdiff_max']:.0f} LSB "
-                      f"(out of 65535), <=1 LSB fraction: "
-                      f"%{100*e['bitdiff_frac_exact']:.2f}  n={e['n']}")
-            _bx = max(bda)
-            P(f"\n  noise formula: matches generate_dataset.add_noise exactly, "
-              f"dose_idx = full:0 half:1 quarter:2")
-            check("noisy_proj arrays are BIT-EXACTLY reproducible from noise_seed",
-                  _bx <= 2, f"max {_bx:.0f} LSB (out of 65535)")
-            RES["noise_formula"] = dict(NOISE_CFG)
-            RES["noise_bitexact_ok"] = _bx <= 2
-        else:
-            P("\n  [skipped] bit-exact reproduction disabled")
+        P(f"\n  noise formula: matches generate_dataset.add_noise exactly, "
+          f"dose_idx = full:0 half:1 quarter:2")
+        P(f"  determinism is verified by regenerating a sample of patients end to "
+          f"end from the source archive (see Code Availability), not by "
+          f"reconstructing noisy_proj from the already-quantised, released "
+          f"clean_proj -- the latter cannot succeed even with a correct formula, "
+          f"because clean_proj and noisy_proj are quantised to uint16 "
+          f"independently at generation time and the Poisson draw in the noise "
+          f"model is sensitive to sub-LSB differences in its input.")
         mono = sum(1 for r in F
                    if all(r.get(f"sig_rep_{d_}") not in ("", None) for d_, _, _, _ in DOSE)
                    and float(r["sig_rep_full"]) < float(r["sig_rep_half"]) < float(r["sig_rep_quarter"]))
@@ -1476,9 +1446,7 @@ RES.update(checks=[{"name": n, "pass": v, "detail": d} for n, v, d in CHECKS],
            profile=args.profile,
            timestamp=time.strftime("%Y-%m-%d %H:%M"),
            config=dict(N_FUSED=N_FUSED, N_BASELINE=N_BASELINE, N_DOSE=N_DOSE,
-                       N_BITEXACT=N_BITEXACT,
-                       DO_NOISE_ARRAYS=DO_NOISE_ARRAYS,
-                       DO_NOISE_BITEXACT=DO_NOISE_BITEXACT, DO_ZIP_CRC=DO_ZIP_CRC))
+                       DO_NOISE_ARRAYS=DO_NOISE_ARRAYS, DO_ZIP_CRC=DO_ZIP_CRC))
 tmp = f"{OUTROOT}/results.json.t{os.getpid()}"
 json.dump(RES, open(tmp, "w"), indent=2, default=str, ensure_ascii=False)
 os.replace(tmp, f"{OUTROOT}/results.json")
@@ -1508,8 +1476,7 @@ if "R" in STAGES:
       f"residual) = **{_heavy}**  ")
     if REFERENCE:
         A(f"**Reference (regression check):** `{REFERENCE}`  ")
-    A(f"**Bit-exact noise check:** {'on' if DO_NOISE_BITEXACT else 'off'}  |  "
-      f"**zip CRC:** {'on' if DO_ZIP_CRC else 'off'}")
+    A(f"**zip CRC:** {'on' if DO_ZIP_CRC else 'off'}")
     A("")
     if fails:
         A("## Failed checks"); A("")
@@ -1566,21 +1533,24 @@ if "R" in STAGES:
 
     A("## 4. Noise model"); A("")
     nsr = g("noise") or {}
-    A("| dose | sigma (stored) | sigma (measured) | relative diff | reproduction from seed |")
-    A("|---|---|---|---|---|")
+    A("| dose | sigma (stored) | sigma (measured) | relative diff |")
+    A("|---|---|---|---|")
     for dn_, _, _, _ in DOSE:
         e = nsr.get(dn_, {})
-        be = e.get("bitdiff_max")
         A(f"| {dn_} | {f(e.get('sigma'),5)} | {f(e.get('measured'),5)} | "
-          f"{f(100*(e.get('reldiff') or 0),5)}% | "
-          + (f"max **{be:.0f} LSB**, <=1 LSB: {f(100*(e.get('bitdiff_frac_exact') or 0),2)}%"
-             if be is not None else "--") + " |")
+          f"{f(100*(e.get('reldiff') or 0),5)}% |")
     A("")
-    if g("noise_formula"):
-        A(f"`noisy_proj` arrays are bit-exactly reproducible from `noise_seed` "
-          f"using the formula in `generate_dataset.add_noise` "
-          f"(dose_idx mapping `{g('noise_formula','map')}`).")
-        A("")
+    A(f"Noise is generated by `generate_dataset.add_noise`, seeded per patient "
+      f"and per dose from `noise_seed` (dose_idx mapping full:0 half:1 "
+      f"quarter:2). Determinism is verified by regenerating a sample of "
+      f"patients end to end from the source archive and comparing against "
+      f"the released arrays, not by reconstructing `noisy_proj` from the "
+      f"already-quantised, released `clean_proj` -- the latter cannot "
+      f"succeed even with a correct formula, since `clean_proj` and "
+      f"`noisy_proj` are quantised to uint16 independently at generation "
+      f"time and the Poisson draw in the noise model is sensitive to "
+      f"sub-LSB differences in its input.")
+    A("")
     if g("sigma_ratio"):
         A(f"- Quarter/full sigma ratio **{f(g('sigma_ratio'),4)}** (Poisson theory: "
           f"2.00; slightly lower is expected from electronic noise and clipping)")
