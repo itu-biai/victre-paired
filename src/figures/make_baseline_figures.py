@@ -442,7 +442,7 @@ try:
     ax[1].set_yticks(yv); ax[1].set_yticklabels(MORDER)
     ax[1].invert_yaxis()
     ax[1].set_xlabel("Masked correlation (real regime)")
-    ax[1].set_title("(b) FBP dominates the real regime")
+    ax[1].set_title("(b) Real-regime correlation by method")
     ax[1].axvline(summ["real"]["corr"].drop("FBP").max(), color="k", ls=":",
                  lw=1, alpha=0.6)
     ax[1].text(corr_real2["FBP"] - 0.01, list(MORDER).index("FBP"),
