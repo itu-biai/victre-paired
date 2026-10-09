@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-VICTRE-Paired — dataset generation (data format v9).
+VICTRE-Paired — dataset generation.
 
-This is the script that produced the released dataset. What changed relative to the
-previous format, and the measurement behind each change: CHANGELOG_v9.md.
+This is the script that produced the released dataset. Each chunk records its own
+`format_version` and a one-line `changes_from_v8` summary.
 
 Builds paired projection/reconstruction chunks from the VICTRE in-silico trial
 source data (Badano et al., 2018;
