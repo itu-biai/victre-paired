@@ -5,7 +5,6 @@ Single source of truth for geometry, normalisation, photon-budget and split
 parameters. Every value here is the one actually used to produce the released
 dataset and is verified against every chunk by validate_dataset.py.
 
-What changed in v9 and why: see CHANGELOG_v9.md.
 """
 
 # ---------------------------------------------------------------------------
