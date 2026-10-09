@@ -23,7 +23,7 @@ Usage
     python figures/make_dataset_figures.py --validation ./validation_report
 """
 
-import os, sys, glob, csv, json, math, argparse
+import os, sys, csv, json, math, argparse
 
 import numpy as np
 import matplotlib
@@ -31,7 +31,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from constants import DENSITIES, DOSES
+from constants import DENSITIES
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--validation", required=True,
