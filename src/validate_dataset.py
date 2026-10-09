@@ -16,9 +16,9 @@ Stages
                   optional zip CRC (--crc)
   3  storage      chunk sizes, per-key breakdown, compression ratio
   4  fused pass   one read per chunk, computing:                       sampled
-                  - normalization invariants (99.5 / 99.8 percentile)
+                  - normalisation invariants (max = 1.0, nothing clipped)
                   - mask = clean > threshold check
-                  - penumbra-strip validity
+                  - absence of the v8 penumbra-strip threshold
                   - flat-field / air pedestal / angular uniformity
                   - noise: measured vs. stored sigma, dose monotonicity,
                     whiteness (determinism verified separately by
@@ -54,8 +54,10 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from constants import (ZOUT, TH, TW, NA, PH, PW, DET_PIX, VOX_XY, ANG, NATIVE_PIX,
                        SID, SDD, OFFX_C, OFFY_A, OFFY_B, DELTA, NATIVE_XY,
-                       DOSES, DOSE_IDX, S_ELEC, MASK_THR, P_RECON, P_PROJ,
-                       DENSITIES, BROKEN_SEEDS)
+                       DOSES, ELEC_PHOTONS, NOISY_LO, NOISY_HI, NOISY_ZERO,
+                       MASK_THR, MASK_ANCHOR, P_RECON_V8, P_PROJ_V8, FORMAT_VERSION,
+                       N_KEYS, DENSITIES, BROKEN_SEEDS)
+from noise import regenerate as regenerate_noisy, decode as decode_noisy, bbox_mask
 
 # =============================================================================
 # CLI
@@ -118,40 +120,32 @@ PEDESTALS  = [0.0, 0.10, 0.20, 0.35, 0.60]
 GEO = dict(SID=SID, SDD=SDD)
 CFG = dict(ZOUT=ZOUT, TH=TH, TW=TW, PH=PH, PW=PW, NA=NA, DET_PIX=DET_PIX,
            VOX_XY=VOX_XY, ANG=ANG, NATIVE_PIX=NATIVE_PIX, MASK_THR=MASK_THR,
-           S_ELEC=S_ELEC, P_RECON=P_RECON, P_PROJ=P_PROJ)
+           MASK_ANCHOR=MASK_ANCHOR, ELEC_PHOTONS=ELEC_PHOTONS,
+           P_RECON_V8=P_RECON_V8, P_PROJ_V8=P_PROJ_V8)
+# (tag, projection key, sigma key, gain). The tag is what every table and figure
+# is keyed on and does NOT change between formats; only the array names did.
 DOSE = [("full", "noisy_proj_full", "sigma_full", DOSES["full"]),
-        ("half", "noisy_proj", "sigma", DOSES["half"]),
+        ("half", "noisy_proj_half", "sigma_half", DOSES["half"]),
         ("quarter", "noisy_proj_quarter", "sigma_quarter", DOSES["quarter"])]
 DENS   = DENSITIES
 BROKEN = BROKEN_SEEDS
-KEYS = {"clean","clean_proj","mask","noisy_proj","noisy_proj_full",
-    "noisy_proj_quarter","sigma","sigma_full","sigma_quarter","is_pos","seed",
+KEYS = {"clean","clean_proj","mask","noisy_proj_full","noisy_proj_half",
+    "noisy_proj_quarter","sigma_full","sigma_half","sigma_quarter","is_pos","seed",
     "density","native_z","native_x","native_y","lesion_coords","lesion_count",
     "control_rois","control_count","recon_scale","proj_scale","noise_seed",
-    "geom_vox_z","geom_offx","geom_offy","geom_offz","strip_valley",
-    "dose_levels","dose_gains","elec_noise","sid","sdd","det_pix"}
+    "geom_vox_z","geom_offx","geom_offy","geom_offz","recon_source_saturated",
+    "dose_levels","dose_gains","elec_noise_photons","noisy_range","sid","sdd","det_pix",
+    "format_version","changes_from_v8"}
+assert len(KEYS) == N_KEYS, f"KEYS has {len(KEYS)} entries, constants says {N_KEYS}"
 
-# =============================================================================
-# Noise formula — kept here as a readable reference matching
-# generate_dataset.py's add_noise() exactly; not called by this script.
-# Regenerating noisy_proj from the *stored* (already-quantised) clean_proj
-# and comparing bit-for-bit against the released noisy_proj is not possible
-# even when this formula is correct: clean_proj and noisy_proj are each
-# quantised to uint16 independently from the pre-quantisation float32 array
-# at generation time, and the Poisson draw here is sensitive enough to a
-# sub-LSB difference in its input that a single quantisation step changes
-# the entire realised RNG stream. Determinism is instead verified by
-# re-running generate_dataset.py end to end on a sample of patients from the
-# source archive and comparing the freshly generated arrays against the
-# released ones (see paper, Code Availability).
-# =============================================================================
-def noise_formula(p, proj_scale, gain, seed, dose_idx, s_elec=S_ELEC):
-    rng = np.random.default_rng(np.uint64(seed) * 10 + np.uint64(dose_idx))
-    I0 = 1.0 / gain
-    I = I0 * np.exp(-np.clip(p, 0, 1) * proj_scale)
-    N = rng.poisson(np.maximum(I, 1e-9)).astype(np.float64)
-    N = N + rng.standard_normal(p.shape) * (s_elec * I0 * 0.02)
-    return np.clip(-np.log(np.maximum(N, 1e-9) / I0) / proj_scale, 0, 1).astype(np.float32)
+# Fields that must NOT appear: v8 names. Their presence means the chunk was
+# produced by the old pipeline, which is a harder failure than a missing field
+# because every downstream number would silently be a v8 number.
+FORBIDDEN_KEYS = {"noisy_proj", "sigma", "strip_valley"}
+
+# Noise model: see noise.py (unchanged from v8). noisy_proj* are generated from
+# the released, quantised clean_proj and therefore regenerate bit-for-bit from
+# the record; stage 4 checks this directly on every sampled patient.
 
 TAB, FIG = f"{OUTROOT}/tables", f"{OUTROOT}/figures"
 CACHE = os.path.join(OUTROOT, ".cache")
@@ -295,9 +289,9 @@ def _sub(h, w, fy=(0.15,0.75), fx=(0.10,0.85)):
 # =============================================================================
 hdr("STAGE 1 -- INDEX")
 SMALL = ["seed","is_pos","density","native_z","native_x","native_y","lesion_count",
-         "control_count","proj_scale","recon_scale","sigma","sigma_full",
+         "control_count","proj_scale","recon_scale","sigma_half","sigma_full",
          "sigma_quarter","noise_seed","geom_vox_z","geom_offx","geom_offy",
-         "geom_offz","strip_valley"]
+         "geom_offz","recon_source_saturated"]
 
 def build_index(root, cache_name):
     cp = f"{TAB}/{cache_name}.json"
@@ -375,14 +369,14 @@ if "2" in STAGES and not stage_begin("2", _S2):
     shp = {"clean": (CFG["ZOUT"], CFG["TH"], CFG["TW"]),
            "mask": (CFG["ZOUT"], CFG["TH"], CFG["TW"]),
            "clean_proj": (CFG["NA"], CFG["PH"], CFG["PW"]),
-           "noisy_proj": (CFG["NA"], CFG["PH"], CFG["PW"]),
+           "noisy_proj_half": (CFG["NA"], CFG["PH"], CFG["PW"]),
            "noisy_proj_full": (CFG["NA"], CFG["PH"], CFG["PW"]),
            "noisy_proj_quarter": (CFG["NA"], CFG["PH"], CFG["PW"])}
     dt = {"clean": np.uint16, "clean_proj": np.uint16, "mask": np.uint8,
-          "noisy_proj": np.uint16, "noisy_proj_full": np.uint16,
+          "noisy_proj_half": np.uint16, "noisy_proj_full": np.uint16,
           "noisy_proj_quarter": np.uint16}
     consts = [("sid", GEO["SID"]), ("sdd", GEO["SDD"]),
-              ("det_pix", CFG["DET_PIX"]), ("elec_noise", CFG["S_ELEC"])]
+              ("det_pix", CFG["DET_PIX"]), ("elec_noise_photons", CFG["ELEC_PHOTONS"])]
     issues, crc_bad, t0 = [], [], time.time()
     for i, f in enumerate(files):
         bn = os.path.basename(f)
@@ -392,6 +386,10 @@ if "2" in STAGES and not stage_begin("2", _S2):
         ks = set(d.files)
         for miss in sorted(KEYS - ks): issues.append(dict(chunk=bn, problem=f"eksik:{miss}"))
         for ex in sorted(ks - KEYS):   issues.append(dict(chunk=bn, problem=f"fazla:{ex}"))
+        for bad_k in sorted(ks & FORBIDDEN_KEYS):
+            issues.append(dict(chunk=bn, problem=f"v8 alani:{bad_k} (chunk eski hattan gelmis)"))
+        if "format_version" in ks and str(d["format_version"]) != FORMAT_VERSION:
+            issues.append(dict(chunk=bn, problem=f"format_version={d['format_version']}!={FORMAT_VERSION}"))
         for k, v in dt.items():
             if k in ks and d[k].dtype != v:
                 issues.append(dict(chunk=bn, problem=f"{k} dtype={d[k].dtype}!={v.__name__}"))
@@ -399,18 +397,21 @@ if "2" in STAGES and not stage_begin("2", _S2):
             if k in ks and tuple(d[k].shape[1:]) != v:
                 issues.append(dict(chunk=bn, problem=f"{k} sekil={d[k].shape[1:]}!={v}"))
         for k in ["proj_scale","recon_scale","geom_vox_z","geom_offx","geom_offy",
-                  "geom_offz","sigma","sigma_full","sigma_quarter","strip_valley"]:
+                  "geom_offz","sigma_half","sigma_full","sigma_quarter",
+                  "recon_source_saturated"]:
             if k in ks and not np.all(np.isfinite(np.asarray(d[k], np.float64))):
                 issues.append(dict(chunk=bn, problem=f"{k} NaN/Inf"))
         for k, v in consts:
             if k in ks and abs(float(np.asarray(d[k]).ravel()[0]) - v) > 1e-6:
                 issues.append(dict(chunk=bn, problem=f"{k}!={v}"))
-        for k, exp in [("dose_levels", [1.0, 0.5, 0.25]),
-                       ("dose_gains", [g for _, _, _, g in DOSE])]:
+        for k, exp in [("dose_gains", [g for _, _, _, g in DOSE]),
+                       ("noisy_range", [NOISY_LO, NOISY_HI])]:
             if k in ks:
                 got = np.asarray(d[k], np.float64).ravel().tolist()
-                if len(got) != len(exp) or any(abs(a-b_) > 1e-9 for a, b_ in zip(got, exp)):
+                if len(got) != len(exp) or any(abs(a-b_) > 1e-6 for a, b_ in zip(got, exp)):
                     issues.append(dict(chunk=bn, problem=f"{k}={got}!={exp}"))
+        if "dose_levels" in ks and [str(x) for x in np.asarray(d["dose_levels"]).ravel()] != ["full", "half", "quarter"]:
+            issues.append(dict(chunk=bn, problem=f"dose_levels={np.asarray(d['dose_levels']).tolist()}"))
         # ayni chunk icindeki batch boyutlari tutarli mi
         ns = {k: d[k].shape[0] for k in ks if getattr(d[k], "ndim", 0) >= 1
               and d[k].shape and k not in ("dose_levels", "dose_gains")}
@@ -433,7 +434,7 @@ if "2" in STAGES and not stage_begin("2", _S2):
           not any(x["problem"].startswith(("eksik","fazla")) for x in issues))
     check("dtypes and shapes as expected",
           not any("dtype" in x["problem"] or "sekil" in x["problem"] for x in issues))
-    check("no NaN/Inf; sid/sdd/det_pix/elec_noise/dose constants correct",
+    check("no NaN/Inf; sid/sdd/det_pix/elec_noise_photons/dose/noisy_range constants correct",
           not any("NaN" in x["problem"] or "!=" in x["problem"] for x in issues))
     check("batch sizes consistent within each chunk",
           not any("batch" in x["problem"] for x in issues))
@@ -655,11 +656,6 @@ def geo_t(dn, nz, delta=None):
     return geo(GEO["SID"], GEO["SDD"], vz, ox, oy,
                -(GEO["SDD"]-GEO["SID"]) + CFG["ZOUT"]*vz/2.0 + dl)
 REF_OFFZ = {}
-def geo_r(dn):
-    vz = REF_GEO["VOX_Z"]; ox, oy = _oxy(dn)
-    oz = REF_OFFZ.get(dn, -(REF_GEO["SDD"]-REF_GEO["SID"]) + CFG["ZOUT"]*vz/2.0 + DELTA[dn])
-    return geo(REF_GEO["SID"], REF_GEO["SDD"], vz, ox, oy, oz)
-
 def probe_score(sid, sdd, vz, ox, oy, oz, probes):
     G = Geo(sid, sdd, vz, ox, oy, oz); tot = []
     for cl, pj in probes:
@@ -707,23 +703,44 @@ if "4" in STAGES:
             cl = f01(d["clean"][b]); cp = f01(d["clean_proj"][b])
             mk = np.asarray(d["mask"][b]) > 0
             qs = float(d["proj_scale"][b]); rs = float(d["recon_scale"][b])
-            vly = float(d["strip_valley"][b]) if "strip_valley" in d.files else np.nan
 
-            # ---- (1) NORMALIZASYON DEGISMEZLERI ----------------------------
+            # ---- (1) NORMALIZASYON DEGISMEZLERI (v9: maksimum, kirpma yok) --
+            # max == 1.0 ve tavanda TAM BIR ornek olmali. Bir taneden fazlaysa
+            # ya kirpma geri gelmis ya da olcek yanlis yazilmistir.
             rec["clean_max"] = float(cl.max())
-            rec["clean_p"]   = float(np.percentile(cl[cl > 0], CFG["P_RECON"])) if (cl>0).any() else np.nan
             rec["proj_max"]  = float(cp.max())
-            rec["proj_p"]    = float(np.percentile(cp[cp > 0], CFG["P_PROJ"])) if (cp>0).any() else np.nan
-            rec["clip_frac_clean"] = float((cl >= 0.99999).mean())
-            rec["clip_frac_proj"]  = float((cp >= 0.99999).mean())
+            rec["n_at_ceiling_clean"] = int((np.asarray(d["clean"][b]) == 65535).sum())
+            rec["n_at_ceiling_proj"]  = int((np.asarray(d["clean_proj"][b]) == 65535).sum())
+            # v8 bu persentile normalize edip kirpiyordu; oran v9'un ne kadar
+            # dinamik aralik kurtardigini olcer (D2: hacimde ~1.77, projeksiyonda ~1.03)
+            rec["clean_max_over_p995"] = (float(cl.max()/np.percentile(cl[cl > 0], P_RECON_V8))
+                                          if (cl > 0).any() else np.nan)
+            rec["proj_max_over_p998"]  = (float(cp.max()/np.percentile(cp[cp > 0], P_PROJ_V8))
+                                          if (cp > 0).any() else np.nan)
             # ---- (2) MASKE = clean > esik ----------------------------------
-            mexp = cl > CFG["MASK_THR"]
+            # Esik NORMALIZE hacme uygulanir, yani fiziksel seviyesi olcege bagli.
+            # mask_thr_phys, esigin ham rekonstruksiyon biriminde nereye dustugunu
+            # verir; v8 ile karsilastirilabilir tek sayi bu (bkz. constants.MASK_ANCHOR).
+            # The generator computes the threshold on the UNNORMALISED volume t as
+            #     MASK_THR * p99.5(t) / max(t)
+            # and `cl` here is t/max(t), so p99.5(t)/max(t) == p99.5(cl) and the same
+            # threshold is recoverable from the released array alone. The percentile is
+            # taken over the WHOLE volume, air included, exactly as the generator does;
+            # restricting it to cl > 0 would give a different number.
+            thr = CFG["MASK_THR"]
+            if CFG["MASK_ANCHOR"] == "p99.5":
+                thr = thr * float(np.percentile(cl, P_RECON_V8))
+            mexp = cl > thr
             inter = np.logical_and(mk, mexp).sum()
             rec["mask_dice_thr"] = float(2*inter/max(mk.sum()+mexp.sum(), 1))
             rec["mask_frac"] = float(mk.mean())
-            # ---- (3) PENUMBRA VADI SINIRI ----------------------------------
-            rec["p_phys_max"] = float(cp.max()*qs); rec["valley"] = vly
-            rec["valley_ok"] = int(np.isnan(vly) or cp.max()*qs <= vly + 1e-3)
+            rec["mask_thr_used"] = float(thr)
+            rec["mask_thr_phys"] = float(thr*rs)          # ham rekon birimi
+            # ---- (3) v8 ESIGI GITTI MI + KAYNAGIN KIRPMASI -----------------
+            rec["p_phys_max"] = float(cp.max()*qs)        # en yuksek atenuasyon, fiziksel
+            rec["strip_valley_absent"] = int("strip_valley" not in d.files)
+            rec["recon_source_saturated"] = (float(d["recon_source_saturated"][b])
+                                             if "recon_source_saturated" in d.files else np.nan)
             # ---- (4) PROJEKSIYON / FLATFIELD -------------------------------
             a = breast = bb = None            # onceki hastadan sizinti olmasin
             live = cp.sum(0) > 0
@@ -754,10 +771,19 @@ if "4" in STAGES:
                 if skey in d.files:
                     rec[f"sig_rep_{dname}"] = float(d[skey][b])
                 if DO_NOISE_ARRAYS and key in d.files:
-                    raw = d[key][b]; stored[dname] = np.asarray(raw)
-                    nzp = f01(raw)
+                    raw = np.asarray(d[key][b]); stored[dname] = raw
+                    nzp = decode_noisy(raw)                       # v8 encoding
                     if supp.sum() > 5000:
                         rec[f"sig_meas_{dname}"] = float((nzp-cp)[supp].std())
+                    # v8 invariants: nothing at the ends of the range, dead border exactly at the zero level
+                    rec[f"clip_hi_{dname}"] = float((raw == 65535).mean()); rec[f"clip_lo_{dname}"] = float((raw == 0).mean())
+                    bb_ = bbox_mask(d["clean_proj"][b])
+                    rec[f"border_zero_{dname}"] = int(bool(np.all(raw[~bb_] == NOISY_ZERO)))
+                    air_ = bb_ & (cp == 0)
+                    if air_.any(): rec[f"air_mean_{dname}"] = float(nzp[air_].mean())
+                    # bit-exact reproduction from the record itself
+                    rep = regenerate_noisy(d["clean_proj"][b], float(r["proj_scale"]), int(s), dname)
+                    rec[f"repro_maxdiff_{dname}"] = int(np.abs(rep.astype(np.int32) - raw.astype(np.int32)).max())
                     if f"sig_rep_{dname}" in rec and f"sig_meas_{dname}" in rec:
                         rp = rec[f"sig_rep_{dname}"]
                         rec[f"sig_reldiff_{dname}"] = abs(rec[f"sig_meas_{dname}"]-rp)/max(rp,1e-9)
@@ -767,17 +793,6 @@ if "4" in STAGES:
                         rec["noise_lag1_row"]  = lag1(dd_[MID][sy, sx], 0)
                         rec["noise_lag1_col"]  = lag1(dd_[MID][sy, sx], 1)
                         rec["noise_lag1_view"] = lag1(dd_[:, sy, sx], 0)
-            # ---- (5b) bit-exact reproduction: NOT checked here ----------------
-            # Regenerating noisy_proj from the *stored* clean_proj and comparing
-            # against the stored noisy_proj cannot succeed even when the noise
-            # formula is correct: clean_proj and noisy_proj are each quantised
-            # to uint16 independently from the pre-quantisation float32 array
-            # at generation time, and the Poisson draw inside the noise model
-            # is sensitive enough to a sub-LSB difference in its input that a
-            # single quantisation step changes the entire realised RNG stream.
-            # Determinism is instead verified by re-running generation end to
-            # end on a sample of patients (Code Availability) and comparing
-            # the freshly generated arrays against the released ones.
             del stored
             # ---- (6) LEZYON / KONTROL ROI ----------------------------------
             nl = int(d["lesion_count"][b]); lc = d["lesion_coords"][b]
@@ -882,32 +897,48 @@ if "5" in STAGES:
 
         # ---------- 1. NORMALIZASYON -----------------------------------------
         P("\n  --- NORMALIZATION INVARIANTS ---")
-        cp_ = C("clean_p"); pp_ = C("proj_p"); cm = C("clean_max"); pm = C("proj_max")
-        P(f"  clean  p{CFG['P_RECON']} = {mn(cp_):.5f} (1.0 olmali)  maks={mn(cm):.5f}  "
-          f"clipped={100*mn(C('clip_frac_clean')):.3f}%")
-        P(f"  proj   p{CFG['P_PROJ']} = {mn(pp_):.5f} (1.0 olmali)  maks={mn(pm):.5f}  "
-          f"clipped={100*mn(C('clip_frac_proj')):.3f}%")
-        check(f"clean {CFG['P_RECON']}. persentil = 1.0 (normalizasyon correct)",
-              abs(mn(cp_)-1.0) < 0.02, f"{mn(cp_):.4f}")
-        check(f"clean_proj {CFG['P_PROJ']}. persentil = 1.0",
-              abs(mn(pp_)-1.0) < 0.02, f"{mn(pp_):.4f}")
-        check("clean maximum does not exceed 1.0", mn(cm) <= 1.0001 and np.max(cm) <= 1.0001,
-              f"max {np.max(cm):.5f}")
-        RES["normalization"] = dict(clean_p=mn(cp_), proj_p=mn(pp_),
-            clean_clip=mn(C("clip_frac_clean")), proj_clip=mn(C("clip_frac_proj")))
+        cm = C("clean_max"); pm = C("proj_max")
+        nc = C("n_at_ceiling_clean"); npj = C("n_at_ceiling_proj")
+        rv = C("clean_max_over_p995"); rp = C("proj_max_over_p998")
+        P(f"  clean      maks = {mn(cm):.5f} (tam 1.0 olmali)   tavanda voksel = {mn(nc):.2f}")
+        P(f"  clean_proj maks = {mn(pm):.5f} (tam 1.0 olmali)   tavanda piksel = {mn(npj):.2f}")
+        P(f"  v8'in kirptigi dinamik aralik:  max/p99.5 = {mn(rv):.3f} (hacim)   "
+          f"max/p99.8 = {mn(rp):.3f} (projeksiyon)")
+        check("clean maksimumu tam 1.0 (maksimuma normalize)",
+              len(cm) and abs(mn(cm)-1.0) < 1e-4, f"{mn(cm):.6f}")
+        check("clean_proj maksimumu tam 1.0",
+              len(pm) and abs(mn(pm)-1.0) < 1e-4, f"{mn(pm):.6f}")
+        # v9'da kirpma YOK: tanim geregi hasta basina tam bir ornek tavanda.
+        # Birden fazlaysa kirpma geri gelmis demektir.
+        check("hacimde tavanda tam 1 voksel (kirpma yok)",
+              len(nc) and nc.max() <= 1, f"maks {int(nc.max()) if len(nc) else -1}")
+        check("projeksiyonda tavanda tam 1 piksel (kirpma yok)",
+              len(npj) and npj.max() <= 1, f"maks {int(npj.max()) if len(npj) else -1}")
+        RES["normalization"] = dict(clean_max=mn(cm), proj_max=mn(pm),
+            clean_ceiling=mn(nc), proj_ceiling=mn(npj),
+            max_over_p995=mn(rv), max_over_p998=mn(rp))
 
         # ---------- 2. MASKE / VADI ------------------------------------------
-        md = C("mask_dice_thr"); vo = C("valley_ok")
-        P(f"\n  --- MASK / PENUMBRA ---")
-        P(f"  Dice(mask, clean>{CFG['MASK_THR']}) = {mn(md):.6f}  min={md.min() if len(md) else float('nan'):.6f}")
+        md = C("mask_dice_thr"); sva = C("strip_valley_absent")
+        rss = C("recon_source_saturated")
+        P(f"\n  --- MASK / v8 ESIGI / KAYNAGIN KIRPMASI ---")
+        P(f"  Dice(mask, clean>esik) = {mn(md):.6f}  min={md.min() if len(md) else float('nan'):.6f}")
+        P(f"  kullanilan esik = {mn(C('mask_thr_used')):.5f} (anchor={CFG['MASK_ANCHOR']})  "
+          f"ham rekon biriminde = {mn(C('mask_thr_phys')):.1f}")
         P(f"  breast mask volume fraction = %{100*mn(C('mask_frac')):.1f}")
-        P(f"  p_phys max = {mn(C('p_phys_max')):.3f}   vadi esigi = {mn(C('valley')):.3f}")
-        check(f"mask tam olarak clean>{CFG['MASK_THR']} (Dice>0.999)",
+        P(f"  en yuksek atenuasyon p_phys = {mn(C('p_phys_max')):.3f}  "
+          f"(v8 esikleri 2.63-3.13 arasindaydi; v9'da esik yok)")
+        P(f"  VICTRE'nin kendi rekonstruksiyonunda uint16 tavaninda voksel: "
+          f"ortalama %{100*mn(rss):.4f}  maks %{100*(rss.max() if len(rss) else 0):.4f}")
+        check("mask tam olarak clean>esik (Dice>0.999)",
               len(md) and md.min() > 0.999, f"min {md.min() if len(md) else 0:.5f}")
-        check("no projection exceeds the penumbra valley threshold",
-              len(vo) and vo.min() > 0.5, f"{int((vo<0.5).sum())} ihlal")
+        check("strip_valley hicbir chunk'ta yok (v8 esigi kaldirildi)",
+              len(sva) and sva.min() > 0.5, f"{int((sva < 0.5).sum())} chunk'ta var")
         RES["mask"] = dict(dice=mn(md), dice_min=float(md.min()) if len(md) else None,
-                           frac=mn(C("mask_frac")))
+                           frac=mn(C("mask_frac")), thr_used=mn(C("mask_thr_used")),
+                           thr_phys=mn(C("mask_thr_phys")), anchor=CFG["MASK_ANCHOR"])
+        RES["source_clipping"] = dict(mean=mn(rss),
+                                      max=float(rss.max()) if len(rss) else None)
 
         # ---------- 3. FLATFIELD ---------------------------------------------
         P(f"\n  --- FLAT-FIELD / AIR ATTENUATION (physical: 0) ---")
@@ -951,15 +982,19 @@ if "5" in STAGES:
                                 if len(C(f"sig_reldiff_{d_}"))] or [np.array([np.nan])])
         check("stored sigma matches measured sigma (<0.5%)",
               np.nanmax(rdall) < 0.005, f"max {100*np.nanmax(rdall):.4f}%")
-        P(f"\n  noise formula: matches generate_dataset.add_noise exactly, "
-          f"dose_idx = full:0 half:1 quarter:2")
-        P(f"  determinism is verified by regenerating a sample of patients end to "
-          f"end from the source archive (see Code Availability), not by "
-          f"reconstructing noisy_proj from the already-quantised, released "
-          f"clean_proj -- the latter cannot succeed even with a correct formula, "
-          f"because clean_proj and noisy_proj are quantised to uint16 "
-          f"independently at generation time and the Poisson draw in the noise "
-          f"model is sensitive to sub-LSB differences in its input.")
+        rep_all = np.concatenate([C(f"repro_maxdiff_{d_}") for d_, _, _, _ in DOSE
+                                  if len(C(f"repro_maxdiff_{d_}"))] or [np.array([np.nan])])
+        check("noisy_proj* regenerate bit-for-bit from the released clean_proj (noise.py)",
+              len(rep_all) and np.nanmax(rep_all) == 0, f"max |diff| {np.nanmax(rep_all):.0f} LSB over {len(rep_all)} arrays")
+        hi_all = np.concatenate([C(f"clip_hi_{d_}") for d_, _, _, _ in DOSE if len(C(f"clip_hi_{d_}"))] or [np.array([np.nan])])
+        check("no noisy value at the top of the stored range (no saturation)", len(hi_all) and np.nanmax(hi_all) == 0)
+        bz_all = np.concatenate([C(f"border_zero_{d_}") for d_, _, _, _ in DOSE if len(C(f"border_zero_{d_}"))] or [np.array([np.nan])])
+        check("dead detector border stored exactly at the zero level", len(bz_all) and np.nanmin(bz_all) == 1)
+        for d_, _, _, _ in DOSE:
+            am = C(f"air_mean_{d_}")
+            if len(am): RES["noise"][d_]["air_mean"] = mn(am)
+        P(f"  air mean (inside the illuminated box, clean=0): " + ", ".join(f"{d_} {RES['noise'][d_].get('air_mean', float('nan')):+.5f}" for d_, _, _, _ in DOSE))
+        P(f"  noise model: noise.py, generated from the released clean_proj; dose_idx = full:0 half:1 quarter:2")
         mono = sum(1 for r in F
                    if all(r.get(f"sig_rep_{d_}") not in ("", None) for d_, _, _, _ in DOSE)
                    and float(r["sig_rep_full"]) < float(r["sig_rep_half"]) < float(r["sig_rep_quarter"]))
@@ -968,8 +1003,8 @@ if "5" in STAGES:
               f"{mono}/{ntot}")
         if RES["noise"]["full"]["sigma"] and RES["noise"]["quarter"]["sigma"]:
             rt = RES["noise"]["quarter"]["sigma"]/RES["noise"]["full"]["sigma"]
-            P(f"  quarter/full sigma ratio = {rt:.4f}  (teorik 2.00; "
-              f"lower than 2 is expected due to electronic noise and clipping)")
+            P(f"  quarter/full sigma ratio = {rt:.4f}  (first-order Poisson 2.00; slightly above 2 "
+              f"is expected from the heavier tail of the log transform at low counts)")
             RES["sigma_ratio"] = rt
         for k, lbl in [("noise_lag1_row","satir"), ("noise_lag1_col","sutun"),
                        ("noise_lag1_view","gorunum")]:
@@ -1228,7 +1263,7 @@ if "7" in STAGES and GPU_OK:
             for dose_name, key, _, _ in [("clean", "clean_proj", None, None)] + \
                                          [(a_, k_, x_, y_) for a_, k_, x_, y_ in DOSE]:
                 if key not in d.files: continue
-                g = f01(d[key][b])
+                g = f01(d[key][b]) if key == "clean_proj" else decode_noisy(d[key][b])
                 for m in METH_D:
                     if (s, dose_name, m) in done: continue
                     x = recon(G, g, m)
@@ -1506,13 +1541,23 @@ if "R" in STAGES:
 
     A("## 2. Normalization and mask"); A("")
     nz = g("normalization") or {}; mk = g("mask") or {}
-    A(f"- `clean` {CFG['P_RECON']}th percentile = **{f(nz.get('clean_p'),5)}** "
-      f"(should be 1.0), clipped voxels {f(100*(nz.get('clean_clip') or 0),4)}%")
-    A(f"- `clean_proj` {CFG['P_PROJ']}th percentile = **{f(nz.get('proj_p'),5)}**, "
-      f"clipped pixels {f(100*(nz.get('proj_clip') or 0),4)}%")
-    A(f"- `mask` = `clean > {CFG['MASK_THR']}` Dice = **{f(mk.get('dice'),6)}** "
+    A(f"- `clean` maximum = **{f(nz.get('clean_max'),5)}** (1.0 by construction); "
+      f"voxels at the uint16 ceiling {f(nz.get('clean_ceiling'),2)} per patient "
+      f"(one, by construction — nothing is clipped)")
+    A(f"- `clean_proj` maximum = **{f(nz.get('proj_max'),5)}**; pixels at the ceiling "
+      f"{f(nz.get('proj_ceiling'),2)} per patient")
+    A(f"- dynamic range recovered relative to the percentile normalisation of the "
+      f"previous format: max/p99.5 = **{f(nz.get('max_over_p995'),3)}** (volume), "
+      f"max/p99.8 = **{f(nz.get('max_over_p998'),3)}** (projections)")
+    A(f"- `mask` = `clean > {f(mk.get('thr_used'),5)}` Dice = **{f(mk.get('dice'),6)}** "
       f"(min {f(mk.get('dice_min'),6)}); breast volume fraction "
       f"{f(100*(mk.get('frac') or 0),1)}%")
+    sc = g("source_clipping") or {}
+    if sc.get("mean") is not None:
+        A(f"- the source reconstructions themselves reach the uint16 ceiling in "
+          f"**{f(100*(sc.get('mean') or 0),4)}%** of voxels on average "
+          f"(worst patient {f(100*(sc.get('max') or 0),4)}%); this is the archive's "
+          f"clipping, recorded per patient as `recon_source_saturated`")
     A("")
 
     A("## 3. Flat-field / air attenuation"); A("")
@@ -1540,20 +1585,13 @@ if "R" in STAGES:
         A(f"| {dn_} | {f(e.get('sigma'),5)} | {f(e.get('measured'),5)} | "
           f"{f(100*(e.get('reldiff') or 0),5)}% |")
     A("")
-    A(f"Noise is generated by `generate_dataset.add_noise`, seeded per patient "
-      f"and per dose from `noise_seed` (dose_idx mapping full:0 half:1 "
-      f"quarter:2). Determinism is verified by regenerating a sample of "
-      f"patients end to end from the source archive and comparing against "
-      f"the released arrays, not by reconstructing `noisy_proj` from the "
-      f"already-quantised, released `clean_proj` -- the latter cannot "
-      f"succeed even with a correct formula, since `clean_proj` and "
-      f"`noisy_proj` are quantised to uint16 independently at generation "
-      f"time and the Poisson draw in the noise model is sensitive to "
-      f"sub-LSB differences in its input.")
+    A(f"Noise is generated by `noise.add_noise` from the released `clean_proj`, seeded per patient "
+      f"and per photon budget from `noise_seed` (dose_idx full:0 half:1 quarter:2); every "
+      f"`noisy_proj*` array regenerates bit-for-bit from the record (checked above).")
     A("")
     if g("sigma_ratio"):
-        A(f"- Quarter/full sigma ratio **{f(g('sigma_ratio'),4)}** (Poisson theory: "
-          f"2.00; slightly lower is expected from electronic noise and clipping)")
+        A(f"- Quarter/full sigma ratio **{f(g('sigma_ratio'),4)}** (first-order Poisson: "
+          f"2.00; slightly above is expected from the heavier tail of the log at low counts)")
     A("")
 
     A("## 5. Geometry -- residual parallax"); A("")

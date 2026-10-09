@@ -32,14 +32,14 @@ Resumable: writes to tables/baseline_raw.csv after every chunk; re-running
 continues from the last completed (patient, regime, method) triple.
 """
 
-import os, sys, glob, gc, time, json, csv, math, argparse
+import os, sys, glob, gc, time, csv, argparse
 
 import numpy as np
-import pandas as pd
 import torch
 from scipy.ndimage import gaussian_filter
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from constants import BROKEN_SEEDS
+from constants import BROKEN_SEEDS, SSIM_SLICE_STEP
+from noise import decode as decode_noisy
 from geometry import Geometry, DEV
 
 # =============================================================================
@@ -98,40 +98,91 @@ def geo_for(vox_z, offx, offy, offz):
 # =============================================================================
 def _mask(m): return np.asarray(m) > 0.5
 
+def affine_match(pred, gt, mask):
+    """Fit a*pred + b to gt by least squares INSIDE the mask, return the matched volume.
+
+    The reconstruction methods return raw volumes (see geometry.py): different
+    methods land on different radiometric scales, and FBP in particular shifts the
+    whole background because its ramp filter removes the DC component. Comparing
+    those directly with PSNR/SSIM/RMSE would score the scale, not the image.
+
+    This is the single, documented normalisation in the pipeline. `corr` and the
+    SDNR-style task metrics are already invariant to it and use the raw volume.
+    """
+    k = _mask(mask)
+    if k.sum() < 100:
+        return np.asarray(pred, np.float32), np.nan, np.nan
+    x = np.asarray(pred, np.float64)[k]
+    y = np.asarray(gt, np.float64)[k]
+    A = np.stack([x, np.ones_like(x)], 1)
+    try:
+        (a, b), *_ = np.linalg.lstsq(A, y, rcond=None)
+    except Exception:
+        return np.asarray(pred, np.float32), np.nan, np.nan
+    return (a * np.asarray(pred, np.float64) + b).astype(np.float32), float(a), float(b)
+
+
 def psnr(pred, gt, mask=None):
     mse = ((pred[_mask(mask)] - gt[_mask(mask)])**2).mean() if mask is not None \
           else ((pred - gt)**2).mean()
     return float(-10 * np.log10(mse + 1e-12))
 
-def psnr_scale_matched(pred, gt, mask):
-    """Fit a*pred+b to gt by least squares before scoring PSNR (fair scale)."""
-    k = _mask(mask)
-    if k.sum() < 100: return np.nan
-    x = np.asarray(pred, np.float64)[k]; y = np.asarray(gt, np.float64)[k]
-    A = np.stack([x, np.ones_like(x)], 1)
-    try:
-        c, *_ = np.linalg.lstsq(A, y, rcond=None)
-    except Exception:
-        return np.nan
-    return float(-10 * np.log10((((A @ c) - y)**2).mean() + 1e-12))
-
 def rmse(pred, gt, mask=None):
     k = _mask(mask) if mask is not None else slice(None)
     return float(np.sqrt(((pred[k] - gt[k])**2).mean())) if (mask is None or k.sum()) else np.nan
 
-def ssim3d(pred, gt):
-    """2D SSIM per slice (every 4th, for speed), averaged."""
+
+def ssim3d(pred, gt, mask, step=SSIM_SLICE_STEP):
+    """2D SSIM averaged over MASKED voxels only, every `step`-th slice.
+
+    The mask is not optional. Without it the average runs over the whole slice,
+    where background and air dominate by count and agree trivially between any
+    two reconstructions; that inflates the score and inflates it unevenly,
+    because methods differ in what they put outside the breast. The same
+    argument the manuscript uses against whole-volume metrics applies here.
+
+    The average is weighted by masked voxel count, not by slice: a slice with
+    forty breast voxels should not carry the same weight as one with forty
+    thousand. This matches the definition used for the published numbers
+    (H1_baselines_detectability), so a reuser's SSIM is comparable to Table 3.
+
+    `step` subsamples slices for speed and is stated here rather than left
+    implicit: at step=2, 28 of 56 slices are scored.
+
+    One property to know before reusing the number. SSIM is computed through a
+    Gaussian window (sigma 1.5), so a masked voxel within about four pixels of
+    the mask boundary still sees background through that window: masking the
+    AVERAGE does not fully isolate the breast. Measured here, with the mask
+    fixed and only the background perturbed:
+
+        background sigma   0.05   0.10   0.30   0.60
+        shift in SSIM     0.0003 0.0014 0.0109 0.0311
+
+    i.e. negligible while the background differs on the scale reconstructions
+    actually differ, and noticeable only if one method leaves artefacts outside
+    the breast as large as the signal inside it. Eroding the mask by five pixels
+    removes the leak almost entirely (a 30x reduction) at the cost of 12 % of the
+    mask, and we deliberately do NOT do that here: the published numbers
+    (Table 3) are computed without erosion, and a reuser's SSIM has to be
+    comparable to them. Report the leak, do not silently change the definition.
+    """
     C1, C2 = 0.01**2, 0.03**2
-    vals = []
-    for z in range(0, pred.shape[0], 4):
+    k = _mask(mask)
+    num, den = 0.0, 0
+    for z in range(0, pred.shape[0], step):
+        m = k[z]
+        if m.sum() < 50:          # too little breast in this slice to be meaningful
+            continue
         x, y = pred[z].astype(np.float64), gt[z].astype(np.float64)
         mx, my = gaussian_filter(x, 1.5), gaussian_filter(y, 1.5)
         vx = gaussian_filter(x*x, 1.5) - mx*mx
         vy = gaussian_filter(y*y, 1.5) - my*my
         vxy = gaussian_filter(x*y, 1.5) - mx*my
-        vals.append((((2*mx*my + C1)*(2*vxy + C2)) /
-                     ((mx*mx + my*my + C1)*(vx + vy + C2) + 1e-12)).mean())
-    return float(np.mean(vals))
+        sm = (((2*mx*my + C1)*(2*vxy + C2)) /
+              ((mx*mx + my*my + C1)*(vx + vy + C2) + 1e-12))
+        num += sm[m].sum()
+        den += int(m.sum())
+    return float(num / den) if den else np.nan
 
 def mass_sdnr(vol, lesion_coords, ri=4, ro=12):
     masses = lesion_coords[lesion_coords[:, 3] >= 4] if len(lesion_coords) else []
@@ -212,8 +263,9 @@ for ci, fp in enumerate(files):
                    float(d["geom_offy"][b]), float(d["geom_offz"][b]))
 
         sources = {"ideal": G.A(gt), "real": to01(d["clean_proj"][b])}
-        if args.noisy_regime and "noisy_proj" in d.files:
-            sources["noisy"] = to01(d["noisy_proj"][b])
+        if args.noisy_regime and "noisy_proj_half" in d.files:
+            # noisy arrays use their own quantisation, not /65535 (see noise.py)
+            sources["noisy"] = decode_noisy(d["noisy_proj_half"][b])
 
         for regime in REGIMES:
             if regime not in sources:
@@ -223,25 +275,28 @@ for ci, fp in enumerate(files):
                 if (seed, regime, name) in done:
                     continue
                 try:
-                    r = fn(G, g)
+                    r = fn(G, g)                      # raw reconstruction
+                    ra, aff_a, aff_b = affine_match(r, gt, mask)
+                    # corr and SDNR are scale-invariant -> raw volume.
+                    # PSNR/SSIM/RMSE are not -> affine-matched volume.
                     rec = {**base, "regime": regime, "method": name,
-                          "corr": corr(r, gt, mask), "psnr": psnr(r, gt),
-                          "psnr_mask": psnr(r, gt, mask),
-                          "psnr_sm": psnr_scale_matched(r, gt, mask),
-                          "ssim": ssim3d(r, gt), "rmse": rmse(r, gt, mask),
+                          "corr": corr(r, gt, mask),
+                          "psnr_mask": psnr(ra, gt, mask),
+                          "ssim": ssim3d(ra, gt, mask), "rmse": rmse(ra, gt, mask),
+                          "aff_a": aff_a, "aff_b": aff_b,
                           "sdnr": mass_sdnr(r, lesion_coords) if is_pos else ""}
-                    del r
+                    del r, ra
                     free()
                 except Exception as e:
                     rec = {**base, "regime": regime, "method": name,
-                          "corr": "", "psnr": "", "psnr_mask": "", "psnr_sm": "",
-                          "ssim": "", "rmse": "", "sdnr": "", "error": str(e)[:60]}
+                          "corr": "", "psnr_mask": "", "ssim": "", "rmse": "",
+                          "aff_a": "", "aff_b": "", "sdnr": "", "error": str(e)[:60]}
                 rows.append(rec)
 
         if (seed, "GT", "GT") not in done:
             rows.append({**base, "regime": "GT", "method": "GT", "corr": 1.0,
-                        "psnr": "", "psnr_mask": "", "psnr_sm": "", "ssim": 1.0,
-                        "rmse": 0.0,
+                        "psnr_mask": "", "ssim": 1.0, "rmse": 0.0,
+                        "aff_a": 1.0, "aff_b": 0.0,
                         "sdnr": mass_sdnr(gt, lesion_coords) if is_pos else ""})
             done.add((seed, "GT", "GT"))
         n_done += 1
@@ -256,5 +311,31 @@ for ci, fp in enumerate(files):
 
 dump_rows(rows, RAW)
 np.save(f"{OUTDIR}/baseline_rows.npy", np.array(rows, dtype=object), allow_pickle=True)
+
+# ---------------------------------------------------------------------------
+# Completeness check. A method that fails on some patients still writes a row,
+# with the metric columns blank -- so an unequal count is the only signal that a
+# column is quietly averaged over fewer patients than its neighbours. Comparing
+# such columns would be comparing different samples.
+# ---------------------------------------------------------------------------
+from collections import Counter
+filled = Counter((r["regime"], r["method"]) for r in rows
+                 if r.get("regime") != "GT" and str(r.get("corr", "")) != "")
+errored = [r for r in rows if r.get("error")]
+if filled:
+    counts = sorted(set(filled.values()))
+    P("\ncompleteness (filled rows per regime x method):")
+    for (rg, m), c in sorted(filled.items()):
+        P(f"   {rg:>6s} {m:<14s} {c}")
+    if errored:
+        P(f"\n{len(errored)} row(s) recorded an error:")
+        for r in errored[:10]:
+            P(f"   seed {r['seed']} {r['regime']}/{r['method']}: {r['error']}")
+    assert len(counts) == 1, (
+        f"methods do not have the same number of filled rows: {counts}. "
+        f"Columns averaged over different samples are not comparable -- see the "
+        f"error rows above.")
+    P(f"\nall {len(filled)} regime x method cells have {counts[0]} filled rows")
+
 P(f"\ndone: {n_done} patients, {len(rows)} rows, {(time.time()-t0)/60:.1f} min")
 P(f"\nNext: python figures/make_baseline_figures.py --out {OUTDIR}")

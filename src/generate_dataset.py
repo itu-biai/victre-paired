@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-VICTRE-Paired — dataset generation.
+VICTRE-Paired — dataset generation (data format v9).
+
+This is the script that produced the released dataset. What changed relative to the
+previous format, and the measurement behind each change: CHANGELOG_v9.md.
 
 Builds paired projection/reconstruction chunks from the VICTRE in-silico trial
 source data (Badano et al., 2018;
@@ -11,12 +14,15 @@ This script assumes the VICTRE source data is already on disk:
   - `dicoms_v2/<UID>/*.dcm`            the corresponding FBP reconstruction slices
   - `manifest.csv`                     SEED -> SeriesInstanceUID mapping
   - lesion `.loc` files                from https://github.com/DIDSR/VICTRE (Locations/)
-  - a flat-field estimate              `flatfield/coefficients.json` +
-                                        `flatfield/valley.json` — see
-                                        docs/flatfield_estimation.md. The true VICTRE
-                                        flat-field is not published; this repository
-                                        estimates one per density class from air-only
-                                        detector regions (paper, Methods).
+  - a flat-field estimate              `flatfield/ff_base.npy`,
+                                        `flatfield/coefficients.json` (see README,
+                                        "Flat-field"). `valley.json` is no longer
+                                        read. The true VICTRE flat-field is
+                                        not published; one is estimated per density
+                                        class from air-only detector regions (paper,
+                                        Methods).
+  - split assignment                   `splits.csv` next to constants.py (seed,split);
+                                        see README, "Split assignment".
 
 Runs on CPU — no GPU/LEAP needed for generation (only for validate_dataset.py and
 run_baselines.py). Safe to interrupt and resume: each chunk is written to a local
@@ -25,23 +31,26 @@ renamed; already-complete chunks are skipped on the next run.
 
 Usage
 -----
+    python generate_dataset.py --split test --dry-run 3    # diagnostics, scratch folder
     python generate_dataset.py --split train --shard 0 --n-shards 3
     python generate_dataset.py --split val
     python generate_dataset.py --split test
-    python generate_dataset.py --split test --dry-run 3     # smoke test, no writes
+
+Run the dry run first and read the diagnostics block: it reports whether the
+illuminated bounding box is itself cutting tissue away, the highest attenuation now
+kept, and that nothing lands on the coding ceiling.
 
 For a large train split, shard the work across parallel processes/machines with
 --shard i --n-shards N (every i-th patient, by sorted seed, modulo N). This is a
 parallelism convenience only; split membership never depends on the shard count.
 """
 
-import os, sys, glob, json, re, gc, time, argparse, shutil
+import os, sys, glob, json, re, gc, time, argparse, shutil, zipfile
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as Fn
-from scipy.ndimage import binary_dilation
 
 try:
     import pydicom
@@ -50,10 +59,12 @@ except ImportError:
 
 from constants import (ZOUT, TH, TW, NA, PH, PW, SID, SDD, DET_PIX, VOX_XY,
                        NATIVE_PIX, OFFX_C, OFFY_A, OFFY_B, DELTA, NATIVE_XY,
-                       DOSES, S_ELEC, MASK_THR)
+                       DOSES, DOSE_IDX, ELEC_PHOTONS, NOISY_LO, NOISY_HI,
+                       MASK_THR, MASK_ANCHOR, FORMAT_VERSION, CHANGES_FROM_V8,
+                       SPLIT_CSV)
+from noise import add_noise, encode as encode_noisy, decode as decode_noisy
 # ANG and the trajectory itself are used by geometry.py at reconstruction time,
-# not during generation; DOSE_IDX is implicit in enumerate(DOSES.items()) below
-# (dose_idx 0/1/2 for full/half/quarter, matching constants.DOSE_IDX).
+# not during generation.
 
 DS = 4              # native -> stored downsample factor
 CHUNK = 8            # patients per .npz
@@ -64,12 +75,12 @@ AIR_THR = 5000       # raw detector counts above which a pixel is "illuminated"
 # =============================================================================
 SOURCE_ROOT   = "/data/VICTRE"                    # projections/, dicoms_v2/, manifest.csv
 LOC_ROOT      = "/data/VICTRE/Locations/ext"       # extracted DIDSR/VICTRE Locations/*.tar.gz
-FLATFIELD_DIR = "/data/VICTRE/flatfield"           # coefficients.json, valley.json
+FLATFIELD_DIR = "/data/VICTRE/flatfield"           # ff_base.npy, coefficients.json
 OUTPUT_ROOT   = "/data/victre-paired"              # where train/val/test chunks are written
 SPLIT_SOURCE  = None                                # optional: existing dataset to read the
-                                                     # split assignment from (keeps membership
-                                                     # stable across regenerations); None ->
-                                                     # derive a fresh deterministic split
+                                                     # split assignment from. Precedence:
+                                                     # splits.csv (released membership) >
+                                                     # SPLIT_SOURCE > deterministic hash
 LOCAL_TMP     = "/tmp/victre_paired_build"
 os.makedirs(LOCAL_TMP, exist_ok=True)
 
@@ -81,7 +92,12 @@ ap.add_argument("--dry-run", type=int, default=0,
                 help="process only this many patients, write to a scratch subfolder")
 ap.add_argument("--force", action="store_true", help="reprocess already-complete chunks")
 ap.add_argument("--selfcheck-every", type=int, default=25)
+ap.add_argument("--diagnose", action="store_true",
+                help="report the v9 scale and bounding-box checks per patient and write "
+                     "diagnostics.json; implied by --dry-run")
 args = ap.parse_args()
+DIAGNOSE = bool(args.diagnose or args.dry_run)
+_DIAG = []
 
 OUT = os.path.join(OUTPUT_ROOT, "_dry_run") if args.dry_run else OUTPUT_ROOT
 os.makedirs(os.path.join(OUT, args.split), exist_ok=True)
@@ -97,14 +113,12 @@ P(f"{'#'*78}\nVICTRE-Paired generation  split={args.split} shard={args.shard}/"
 # Flat-field (per-density polynomial correction + penumbra-strip threshold)
 # =============================================================================
 hdr("Flat-field")
-coef_path   = os.path.join(FLATFIELD_DIR, "coefficients.json")
-valley_path = os.path.join(FLATFIELD_DIR, "valley.json")
-if not (os.path.exists(coef_path) and os.path.exists(valley_path)):
-    sys.exit(f"Missing {coef_path} or {valley_path}. Build them first — see "
-             f"docs/flatfield_estimation.md.")
-COEF   = json.load(open(coef_path))
-VALLEY = json.load(open(valley_path))
-P("valley thresholds: " + ", ".join(f"{d}={v:.3f}" for d, v in VALLEY.items()))
+coef_path = os.path.join(FLATFIELD_DIR, "coefficients.json")
+if not os.path.exists(coef_path):
+    sys.exit(f"Missing {coef_path}. See README, 'Flat-field'.")
+COEF = json.load(open(coef_path))
+# valley.json is no longer used: v9 does not remove a penumbra strip (see load_projections).
+P("v9: no penumbra-strip threshold; valley.json is not read")
 
 # native (pre-downsample) detector shape, from the VICTRE source geometry
 NATIVE_DET_H, NATIVE_DET_W = 3000, 1500
@@ -112,8 +126,8 @@ _rr, _cc = np.meshgrid(np.arange(NATIVE_DET_H) / NATIVE_DET_H,
                        np.arange(NATIVE_DET_W) / NATIVE_DET_W, indexing="ij")
 FF_BASE_PATH = os.path.join(FLATFIELD_DIR, "ff_base.npy")
 if not os.path.exists(FF_BASE_PATH):
-    sys.exit(f"Missing {FF_BASE_PATH} — the per-view maximum-projection base flat-field "
-             f"(see docs/flatfield_estimation.md, step 1).")
+    sys.exit(f"Missing {FF_BASE_PATH} — the per-view base flat-field "
+             f"(see README, 'Flat-field').")
 FF_BASE = np.load(FF_BASE_PATH).astype(np.float32)   # (NA, 3000, 1500)
 
 _ff_cache = {}
@@ -165,7 +179,13 @@ P(f"  patients with .loc: {len(seed2loc)}  SP: {sum(seed2pos.values())}  "
 # Split assignment
 # =============================================================================
 hdr("Split")
-if SPLIT_SOURCE:
+_split_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), SPLIT_CSV)
+if os.path.exists(_split_csv):
+    _df = pd.read_csv(_split_csv)
+    seed2split = {int(s): str(sp) for s, sp in zip(_df["seed"], _df["split"])}
+    P(f"  read from {SPLIT_CSV}: "
+      f"{ {sp: sum(1 for v in seed2split.values() if v == sp) for sp in ['train','val','test']} }")
+elif SPLIT_SOURCE:
     seed2split = {}
     for sp in ["train", "val", "test"]:
         for f in sorted(glob.glob(f"{SPLIT_SOURCE}/{sp}/*.npz")):
@@ -176,7 +196,8 @@ if SPLIT_SOURCE:
     P(f"  read from {SPLIT_SOURCE}: "
       f"{ {sp: sum(1 for v in seed2split.values() if v == sp) for sp in ['train','val','test']} }")
 else:
-    # Deterministic 80/10/10 split by seed hash, stable across re-runs.
+    # Fallback: deterministic 80/10/10 split by seed hash. Stable across re-runs,
+    # but NOT the released membership -- use splits.csv for that.
     import hashlib
     def split_of(seed):
         h = int(hashlib.sha256(str(seed).encode()).hexdigest(), 16) % 100
@@ -219,18 +240,21 @@ def load_projections(seed, density):
     """Real MC projections -> flat-field-corrected log-attenuation, NOT shifted.
 
     Mirrors the source pixel array through: illuminated-region bounding box,
-    log(flatfield) - log(I) attenuation, penumbra-strip removal (values above
-    the per-density valley threshold), 4x downsample, 99.8-percentile
-    normalization. No empirical alignment shift is applied — the projection
-    geometry needed to relate this to `clean` is written per patient instead
-    (see geom_for below / geom_* fields).
+    log(flatfield) - log(I) attenuation, 4x downsample, normalisation by the
+    maximum. No empirical alignment shift is applied — the projection geometry
+    needed to relate this to `clean` is written per patient instead (see
+    geometry_for below / geom_* fields).
+
+    v9 differs from v8 in two ways, both of them removals: there is no
+    penumbra-strip threshold, and the scale is the maximum rather than the
+    99.8th percentile, so no value is clipped.
     """
     files = projection_files(seed)
     if files is None:
         return None, None
     ff = build_flatfield(density)
-    valley = VALLEY[density]
     views = []
+    diag = dict(tissue_outside_bbox=0.0, max_p=0.0, n_views=0)
     for view, f in enumerate(files):
         I = pydicom.dcmread(f).pixel_array.astype(np.float32)
         illuminated = I > AIR_THR
@@ -240,31 +264,86 @@ def load_projections(seed, density):
         bbox = np.zeros_like(illuminated)
         bbox[ys.min():ys.max()+1, xs.min():xs.max()+1] = True
         p = np.clip(np.log(ff[view]) - np.log(np.clip(I, 1, None)), 0, None)
+        # v9 CHANGE 1: no penumbra-strip removal. D1 showed the beam overfills the
+        # detector (MC-GPU aperture 34.8 x 17.0 cm vs a 25.5 x 12.75 cm detector), so
+        # there is no collimator shadow; D2 showed the readout floor is never reached
+        # within the measured range (p stays usable to ~4.2 against thresholds at
+        # 2.6-3.1). The threshold was deleting measurable tissue -- 17 % of it in dense
+        # breasts. See overleaf/NUMBERS.md, "D1 + D2".
+        if DIAGNOSE:
+            # does the illuminated-region bounding box itself cut tissue away?
+            tis = p > 0.10
+            if tis.any():
+                diag["tissue_outside_bbox"] += float((tis & ~bbox).sum()) / float(tis.sum())
+            diag["max_p"] = max(diag["max_p"], float(p[bbox].max()))
+            diag["n_views"] += 1
         p = np.where(bbox, p, 0.0)
-        strip = binary_dilation(p > valley, iterations=1)     # penumbra strip + 1px margin
-        views.append(downsample(np.where(strip, 0.0, p)))
+        views.append(downsample(p))
         del I
     views = np.stack(views)
-    nonzero = views[views > 0]
-    if nonzero.size == 0:
+    if not (views > 0).any():
         return None, None
-    scale = float(np.percentile(nonzero, 99.8) + 1e-6)
-    views = fit_to(np.clip(views / scale, 0, 1), PH, PW)
+    # v9 CHANGE 2: normalise by the maximum, not the 99.8th percentile, so nothing
+    # clips. D2 measured max/p99.8 = 1.013-1.075 once the strip is kept, so this costs
+    # 1.3-7.5 % of the coding levels and removes the 0.2 % that used to saturate.
+    # Rounded to float32 on the way out, and the noise is generated with this same
+    # value. `proj_scale` is stored as float32; if generation used the float64 value
+    # the user could not reproduce the stored noisy arrays from the record. The
+    # difference is small but not zero -- measured at ~300-1900 pixels per array, 1 LSB
+    # -- and it would make the bit-exactness claim false. Using the stored value makes
+    # it true by construction.
+    scale = float(np.float32(views.max() + 1e-6))
+    views = fit_to(views / scale, PH, PW)
+    if DIAGNOSE:
+        diag["tissue_outside_bbox"] /= max(diag["n_views"], 1)
+        _DIAG.append(dict(kind="proj", seed=seed, density=density, scale=scale,
+                          max_p_native=diag["max_p"],
+                          frac_tissue_outside_bbox=diag["tissue_outside_bbox"],
+                          frac_at_ceiling=float((views >= 1.0).mean()),
+                          pooled_shape=tuple(np.stack([downsample(np.zeros((NATIVE_DET_H, NATIVE_DET_W), np.float32))]).shape[1:]),
+                          padded_to=(PH, PW)))
     return views.astype(np.float32), scale
 
 def load_reconstruction(uid):
-    """FBP reconstruction volume -> resampled to ZOUT slices, 99.5-pct normalized."""
+    """FBP reconstruction volume -> resampled to ZOUT slices, max-normalised (v9)."""
     files = list(glob.glob(f"{SOURCE_ROOT}/dicoms_v2/{uid}/*.dcm"))
     slices = sorted([(int(pydicom.dcmread(f, stop_before_pixels=True).InstanceNumber),
                       pydicom.dcmread(f).pixel_array.astype(np.float32)) for f in files],
                     key=lambda x: x[0])
+    # VICTRE's own reconstructions are uint16 and some of them reach the ceiling. That is
+    # the source's clipping, not ours, and it cannot be recovered after the fact because
+    # v8's percentile normalisation removed the evidence. Recording it costs nothing and
+    # turns an unknown into a number the paper can state.
+    n_sat = sum(int((img >= 65535).sum()) for _, img in slices)
+    n_tot = sum(int(img.size) for _, img in slices)
+    src_sat = float(n_sat) / max(n_tot, 1)
     volume = np.stack([downsample(img) for _, img in slices])
     native_z = len(slices)
     t = torch.from_numpy(volume)[None, None]
     t = Fn.interpolate(t, size=(ZOUT, volume.shape[1], volume.shape[2]),
                        mode="trilinear", align_corners=False)[0, 0].numpy()
-    scale = float(np.percentile(t, 99.5) + 1e-3)
-    return fit_to(np.clip(t / scale, 0, 1).astype(np.float32), TH, TW), native_z, scale
+    # v9 CHANGE 3: normalise by the maximum, not the 99.5th percentile. D2 measured
+    # max/p99.5 = 1.768 (worst 2.013) and D1 found 0.68 % of breast voxels sitting at
+    # the ceiling -- the brightest structures were being flattened to roughly half
+    # their value. This leaves about 37,000 levels for the old p99.5 range.
+    # (recon_scale does not feed the noise model, but it is rounded the same way so the
+    #  number used here and the number in the record are the same)
+    scale = float(np.float32(t.max() + 1e-3))
+    # The mask threshold is applied to the NORMALISED volume, so the normalisation
+    # anchor decides its physical level. With MASK_ANCHOR = "p99.5" the threshold is
+    # rescaled to sit exactly where the previous format put it, which makes the
+    # breast support identical across formats; with "max" the literal 0.08 is used.
+    # See constants.py for why this is a decision and not an implementation detail.
+    mask_thr = MASK_THR
+    if MASK_ANCHOR == "p99.5":
+        mask_thr = MASK_THR * float(np.percentile(t, 99.5)) / max(scale, 1e-9)
+    if DIAGNOSE:
+        _DIAG.append(dict(kind="vol", uid=uid, scale=scale, native_z=native_z,
+                          p995=float(np.percentile(t, 99.5)),
+                          ratio_max_over_p995=float(t.max()/max(np.percentile(t, 99.5), 1e-9)),
+                          frac_at_ceiling=float((t >= t.max()).mean()),
+                          source_saturated=src_sat))
+    return fit_to((t / scale).astype(np.float32), TH, TW), native_z, scale, src_sat, mask_thr
 
 def load_lesions(key, native_z):
     """Lesion coordinates for signal-present (SP) patients only."""
@@ -301,15 +380,6 @@ def load_control_rois(key, native_z, max_rois=12):
         rows.append([z, h, w, roi_id, float(in_bounds)])
     return np.array(rows[:max_rois], np.float32) if rows else np.zeros((0, 5), np.float32)
 
-def add_noise(p, proj_scale, gain, seed, dose_idx):
-    """Intensity-domain Poisson + electronic noise, per-patient-per-dose seed."""
-    rng = np.random.default_rng(np.uint64(seed) * 10 + np.uint64(dose_idx))
-    I0 = 1.0 / gain
-    I  = I0 * np.exp(-np.clip(p, 0, 1) * proj_scale)
-    N  = rng.poisson(np.maximum(I, 1e-9)).astype(np.float64)
-    N += rng.standard_normal(p.shape) * (S_ELEC * I0 * 0.02)
-    return np.clip(-np.log(np.maximum(N, 1e-9) / I0) / proj_scale, 0, 1).astype(np.float32)
-
 def to_uint16(a):
     return np.round(np.clip(a, 0, 1) * 65535).astype(np.uint16)
 
@@ -325,8 +395,13 @@ def geometry_for(density, native_z):
 # =============================================================================
 # Chunk writer (atomic: local tmp -> copy to destination tmp name -> rename)
 # =============================================================================
+def chunk_name(chunk_idx, split_name):
+    # The shard is part of the name so that concurrent shards of the same split cannot
+    # overwrite each other's chunks. Single-shard runs (val, test) use s0.
+    return f"{split_name}_s{args.shard}_chunk_{chunk_idx:05d}.npz"
+
 def write_chunk(buf, chunk_idx, split_name):
-    fname = f"{split_name}_chunk_{chunk_idx:05d}.npz"
+    fname = chunk_name(chunk_idx, split_name)
     local_path = os.path.join(LOCAL_TMP, fname)
     d = dict(
         clean=to_uint16(np.stack([b["clean"] for b in buf])),
@@ -349,16 +424,24 @@ def write_chunk(buf, chunk_idx, split_name):
         geom_offx=np.array([b["offx"] for b in buf], np.float32),
         geom_offy=np.array([b["offy"] for b in buf], np.float32),
         geom_offz=np.array([b["offz"] for b in buf], np.float32),
-        strip_valley=np.array([b["valley"] for b in buf], np.float32),
+        # fraction of the SOURCE DICOM voxels sitting at the uint16 ceiling: VICTRE's own
+        # clipping, recorded per patient so users can exclude or weight those cases
+        recon_source_saturated=np.array([b["recon_src_sat"] for b in buf], np.float32),
         dose_levels=np.array(["full", "half", "quarter"]),
         dose_gains=np.array([DOSES["full"], DOSES["half"], DOSES["quarter"]], np.float32),
-        elec_noise=np.float32(S_ELEC),
+        elec_noise_photons=np.float32(ELEC_PHOTONS),
+        noisy_range=np.array([NOISY_LO, NOISY_HI], np.float32),
         sid=np.float32(SID), sdd=np.float32(SDD), det_pix=np.float32(DET_PIX),
+        format_version=np.array(FORMAT_VERSION),
+        changes_from_v8=np.array(CHANGES_FROM_V8),
     )
     for tag in DOSES:
-        proj_key  = "noisy_proj" if tag == "half" else f"noisy_proj_{tag}"
-        sigma_key = "sigma" if tag == "half" else f"sigma_{tag}"
-        d[proj_key]  = to_uint16(np.stack([b["noisy"][tag] for b in buf]))
+        # v9 CHANGE 4: the half-dose arrays carry their dose in the name like the other
+        # two. v8 called them `noisy_proj` and `sigma`, which left the reader to infer
+        # the budget from Table 1.
+        proj_key  = f"noisy_proj_{tag}"
+        sigma_key = f"sigma_{tag}"
+        d[proj_key]  = np.stack([b["noisy"][tag] for b in buf])          # already uint16 (v8 encoding)
         d[sigma_key] = np.array([b["sigma"][tag] for b in buf], np.float32)
 
     np.savez_compressed(local_path, **d)
@@ -370,32 +453,71 @@ def write_chunk(buf, chunk_idx, split_name):
     os.remove(local_path)
     return final_path
 
+N_KEYS_EXPECTED = 36      # fields in a v9 record == .npy members inside the .npz
+
+def chunk_ok(path):
+    """Does the chunk exist AND open?
+
+    os.path.exists is not enough. The write path is local file -> copy to the
+    output directory -> os.replace. The rename is atomic, but when the output
+    directory is a network/FUSE mount the upload behind it is not: if the process
+    or the mount dies mid-copy, a truncated .npz is left behind that raises
+    BadZipFile when read. Treating that as complete would skip it forever and the
+    run would finish with a hole in the data.
+
+    The check is cheap: zipfile reads only the central directory at the end of the
+    file and decompresses nothing. Truncation is exactly what breaks that.
+    """
+    if not os.path.exists(path):
+        return False
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+    except Exception as e:
+        P(f"  [corrupt] {os.path.basename(path)}: {type(e).__name__} -> will be rebuilt")
+        return False
+    if len(names) != N_KEYS_EXPECTED:
+        P(f"  [incomplete] {os.path.basename(path)}: {len(names)}/{N_KEYS_EXPECTED} fields "
+          f"-> will be rebuilt")
+        return False
+    return True
+
+
 def chunk_exists(chunk_idx, split_name):
-    return os.path.exists(os.path.join(OUT, split_name, f"{split_name}_chunk_{chunk_idx:05d}.npz"))
+    return chunk_ok(os.path.join(OUT, split_name, chunk_name(chunk_idx, split_name)))
 
 # =============================================================================
 # Main loop
 # =============================================================================
 hdr(f"Generating {len(ITEMS)} patients")
 split_name = args.split
-buf, chunk_idx, done, skipped, issues = [], 0, 0, 0, []
+# Resume. Chunk i always holds ITEMS[CHUNK*i : CHUNK*(i+1)], so resuming means
+# skipping the chunks already on disk up to the first gap and cutting the list
+# there. Doing the skip inside the per-patient loop -- as this did until it was
+# caught in production -- consumes one ITEM per skipped CHUNK, so every patient in
+# ITEMS[K : CHUNK*K] is written a second time into a new chunk and the shard ends
+# up with far more chunks than patients.
+start_chunk = 0
+if not args.force:
+    while chunk_exists(start_chunk, split_name):
+        start_chunk += 1
+todo = ITEMS[CHUNK * start_chunk:]
+buf, chunk_idx, skipped, issues = [], start_chunk, 0, []
+done, n_new = CHUNK * start_chunk, 0        # done: absolute · n_new: this session
+if start_chunk:
+    P(f"  [resume] {start_chunk} complete chunks -> first {CHUNK*start_chunk} patients "
+      f"skipped, {len(todo)} to go")
 t0 = time.time()
 
-for idx, (seed, key, uid, density) in enumerate(ITEMS):
-    if not args.force and not buf and chunk_exists(chunk_idx, split_name):
-        chunk_idx += 1
-        done += CHUNK
-        if done % (CHUNK * 20) == 0:
-            P(f"  [skip] already-complete chunks... ({done} patients)")
-        continue
+for idx, (seed, key, uid, density) in enumerate(todo):
     try:
         proj, proj_scale = load_projections(seed, density)
         if proj is None:
             P(f"  ! {seed}: could not read projections / no air region, skipping")
             skipped += 1
             continue
-        clean, native_z, recon_scale = load_reconstruction(uid)
-        mask = (clean > MASK_THR)
+        clean, native_z, recon_scale, recon_src_sat, mask_thr = load_reconstruction(uid)
+        mask = (clean > mask_thr)
 
         lesions_raw = load_lesions(key, native_z)
         lesions = np.zeros((8, 4), np.float32)
@@ -409,12 +531,15 @@ for idx, (seed, key, uid, density) in enumerate(ITEMS):
         if n_controls:
             controls[:n_controls] = controls_raw[:n_controls]
 
+        # noise is generated from the quantised clean_proj (what the record stores),
+        # so the released noisy arrays regenerate bit-for-bit from the record
+        proj_u16 = to_uint16(proj); proj_q = proj_u16.astype(np.float32) / 65535.0
         noisy, sigma = {}, {}
-        for dose_idx, (tag, gain) in enumerate(DOSES.items()):
-            n = add_noise(proj, proj_scale, gain, seed, dose_idx)
-            noisy[tag] = n
-            support = proj > 0.02
-            sigma[tag] = float((n - proj)[support].std()) if support.any() else 0.0
+        for tag, gain in DOSES.items():
+            n_u16 = encode_noisy(add_noise(proj_u16, proj_scale, gain, seed, DOSE_IDX[tag]))
+            noisy[tag] = n_u16
+            support = proj_q > 0.02
+            sigma[tag] = float((decode_noisy(n_u16) - proj_q)[support].std()) if support.any() else 0.0
 
         vox_z, offx, offy, offz = geometry_for(density, native_z)
         native_x, native_y = NATIVE_XY[density]
@@ -438,13 +563,14 @@ for idx, (seed, key, uid, density) in enumerate(ITEMS):
                         lesions=lesions, n_lesions=n_lesions,
                         controls=controls, n_controls=n_controls,
                         recon_scale=recon_scale, proj_scale=proj_scale,
+                        recon_src_sat=recon_src_sat,
                         noisy=noisy, sigma=sigma,
-                        vox_z=vox_z, offx=offx, offy=offy, offz=offz,
-                        valley=VALLEY[density]))
+                        vox_z=vox_z, offx=offx, offy=offy, offz=offz))
         done += 1
+        n_new += 1
         elapsed = time.time() - t0
-        rate = elapsed / max(1, done)
-        remaining = (len(ITEMS) - done - skipped) * rate
+        rate = elapsed / max(1, n_new)      # this session only; `done` counts skipped chunks too
+        remaining = max(0, len(ITEMS) - done - skipped) * rate
         P(f"  [{done}/{len(ITEMS)}] seed={seed} {density:>12s} done | "
           f"{elapsed/3600:.2f} h elapsed | ~{remaining/3600:.1f} h remaining | "
           f"{rate:.0f} s/patient")
@@ -460,6 +586,33 @@ for idx, (seed, key, uid, density) in enumerate(ITEMS):
         buf = []
         chunk_idx += 1
     gc.collect()
+
+if DIAGNOSE and _DIAG:
+    dp = os.path.join(OUT, f"diagnostics_{args.split}.json")
+    json.dump(_DIAG, open(dp, "w"), indent=1, default=float)
+    pr = [d for d in _DIAG if d["kind"] == "proj"]
+    vo = [d for d in _DIAG if d["kind"] == "vol"]
+    hdr("v9 diagnostics")
+    if pr:
+        P(f"  projections, n={len(pr)}")
+        P(f"    tissue outside the illuminated bounding box : "
+          f"{100*max(d['frac_tissue_outside_bbox'] for d in pr):.4f} % (worst patient)  "
+          f"<- must be ~0, otherwise the box itself is cutting tissue")
+        P(f"    highest attenuation kept (native)           : "
+          f"{max(d['max_p_native'] for d in pr):.2f}  (v8 cut everything above 2.6-3.1)")
+        P(f"    pixels at the coding ceiling                : "
+          f"{100*max(d['frac_at_ceiling'] for d in pr):.4f} %  <- one pixel per patient by construction")
+        P(f"    pooled {pr[0]['pooled_shape']} padded to {pr[0]['padded_to']} (padding goes on the bottom/right)")
+        P(f"    proj_scale range                            : "
+          f"{min(d['scale'] for d in pr):.3f} .. {max(d['scale'] for d in pr):.3f}")
+    if vo:
+        P(f"  volumes, n={len(vo)}")
+        P(f"    max / p99.5                                 : "
+          f"{np.mean([d['ratio_max_over_p995'] for d in vo]):.3f}  "
+          f"(worst {max(d['ratio_max_over_p995'] for d in vo):.3f})")
+        P(f"    recon_scale range                           : "
+          f"{min(d['scale'] for d in vo):.3f} .. {max(d['scale'] for d in vo):.3f}")
+    P(f"  written to {dp}")
 
 if buf:
     path = write_chunk(buf, chunk_idx, split_name)

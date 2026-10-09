@@ -17,7 +17,11 @@ Example
                  offy=float(d["geom_offy"][i]),
                  offz=float(d["geom_offz"][i]))
     proj  = d["clean_proj"][i].astype(np.float32) / 65535
-    recon = G.fbp(proj)                     # (56, 408, 336)
+    recon = G.fbp(proj)                     # (56, 408, 336), RAW scale
+
+Every reconstruction method returns the raw volume; compare it to the reference
+with a scale-invariant metric (masked correlation) or after an affine fit inside
+the breast mask (see run_baselines.py).
 """
 
 import math
@@ -52,14 +56,26 @@ class Geometry:
                      float(offx), float(offy), float(offz))
         try:
             L.set_log_error()          # silence LEAP's per-iteration prints
-        except Exception:
-            pass
+        except AttributeError:
+            # Only an old/renamed LEAP API is tolerated here. A bare `except
+            # Exception: pass` would also swallow a CUDA or geometry failure and
+            # leave a silently broken object behind.
+            print("[geometry] note: LEAP has no set_log_error(); "
+                  "per-iteration output stays on")
         self.L = L
         # scale factor so that A(ones) has unit max (keeps metrics comparable)
         with torch.no_grad():
             f = torch.ones(ZOUT, TH, TW, device=DEV)
             g = torch.zeros((NA, PH, PW), device=DEV)
             L.project(g, f.permute(0, 2, 1).contiguous())
+        # Scale convention. `ps = max(A(ones))` converts between two units:
+        #   LEAP units          - what project()/backproject() work in
+        #   unit-max units      - what A() returns and what the released
+        #                         `clean_proj` is comparable to
+        # A() divides by ps, so every reconstruction method multiplies its input
+        # by ps to invert that. Before this was made uniform, SIRT/SART/ASD-POCS
+        # scaled the input but ATp and FBP did not, so the same projection came
+        # back at two different scales depending on the method.
         self.ps = float(g.max().item())
         del f, g
         torch.cuda.empty_cache()
@@ -86,17 +102,24 @@ class Geometry:
         torch.cuda.empty_cache()
         return out
 
-    @staticmethod
-    def _norm01(v):
-        v = v - v.min()
-        return v / (v.max() + 1e-8)
-
     # -- reconstruction methods --------------------------------------------
+    #
+    # Every method takes a projection in unit-max units (what A() returns, and
+    # what `clean_proj / 65535` is) and returns the RAW reconstruction. Nothing
+    # is normalised here.
+    #
+    # These used to end with a min-max rescale to [0, 1]. That made every
+    # radiometric metric (PSNR, SSIM, RMSE) a function of the two extreme voxels
+    # rather than of the reconstruction, and it silently differed between methods
+    # because the input scaling was not uniform. Normalisation now happens once,
+    # in the metric layer, where it is a documented affine fit inside the breast
+    # mask (see run_baselines.py: affine_match).
+
     def atp(self, proj_np):
-        """Adjoint (back-projection), Aᵀp."""
-        g = torch.from_numpy(np.ascontiguousarray(proj_np)).float().to(DEV)
+        """Adjoint (back-projection), Aᵀp. Returns the raw volume."""
+        g = torch.from_numpy(np.ascontiguousarray(proj_np * self.ps)).float().to(DEV)
         x = self._AT(g)
-        out = self._norm01(x).cpu().numpy()
+        out = x.cpu().numpy()
         del g, x
         torch.cuda.empty_cache()
         return out
@@ -105,7 +128,7 @@ class Geometry:
         g = torch.from_numpy(np.ascontiguousarray(proj_np * self.ps)).float().to(DEV)
         f = torch.zeros(ZOUT, TW, TH, device=DEV)
         self.L.SIRT(g.contiguous(), f, n)
-        out = self._norm01(f.permute(0, 2, 1).contiguous()).cpu().numpy()
+        out = f.permute(0, 2, 1).contiguous().cpu().numpy()
         del g, f
         torch.cuda.empty_cache()
         return out
@@ -114,7 +137,7 @@ class Geometry:
         g = torch.from_numpy(np.ascontiguousarray(proj_np * self.ps)).float().to(DEV)
         f = torch.zeros(ZOUT, TW, TH, device=DEV)
         self.L.SART(g.contiguous(), f, n)
-        out = self._norm01(f.permute(0, 2, 1).contiguous()).cpu().numpy()
+        out = f.permute(0, 2, 1).contiguous().cpu().numpy()
         del g, f
         torch.cuda.empty_cache()
         return out
@@ -123,7 +146,7 @@ class Geometry:
         g = torch.from_numpy(np.ascontiguousarray(proj_np * self.ps)).float().to(DEV)
         f = torch.zeros(ZOUT, TW, TH, device=DEV)
         self.L.ASDPOCS(g.contiguous(), f, n_asd, n_sub, n_tv)
-        out = self._norm01(f.permute(0, 2, 1).contiguous()).cpu().numpy()
+        out = f.permute(0, 2, 1).contiguous().cpu().numpy()
         del g, f
         torch.cuda.empty_cache()
         return out
@@ -152,9 +175,9 @@ class Geometry:
             H = H * (0.5 + 0.5 * np.cos(np.pi * fr / max(fr.max(), 1e-9)))
         gf = np.fft.irfft(np.fft.rfft(gp, axis=1) * H[None, :, None],
                           n=n, axis=1)[:, pl:pl + PH, :].astype(np.float32)
-        t = torch.from_numpy(np.ascontiguousarray(gf)).float().to(DEV)
+        t = torch.from_numpy(np.ascontiguousarray(gf * self.ps)).float().to(DEV)
         x = self._AT(t)
-        out = self._norm01(x).cpu().numpy()
+        out = x.cpu().numpy()
         del t, x
         torch.cuda.empty_cache()
         return out
