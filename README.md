@@ -30,10 +30,9 @@ from existing VICTRE-derived resources, which target detection and segmentation.
 | Densities | fatty, scattered, heterogeneous, dense |
 | License | data: CC BY 4.0 · code: MIT · source: CC BY 3.0 |
 
-`format_version` in every chunk identifies the data format; `changes_from_v8`
-carries a one-line summary of what the current format changed, so a loaded record
-states its own provenance. `src/CHANGELOG_v9.md` has the measurement behind each
-change.
+`format_version` in every chunk identifies the data format and `changes_from_v8`
+carries a one-line summary of what that format changed, so a loaded record states
+its own provenance without reference to anything outside it.
 
 Two reconstruction regimes are supported (see [Two regimes](#two-regimes-inverse-crime)):
 an **inverse-crime** regime driven by synthetic forward projections `A(clean)`,
@@ -259,8 +258,7 @@ repository.
 A third file, `valley.json`, was read by the previous format: a per-density
 attenuation threshold above which pixels were zeroed, on the assumption that they
 were a collimator penumbra. They were not — they were the thickest tissue against
-the chest wall. The threshold is gone and the file is no longer read; the
-measurements behind that are in `src/CHANGELOG_v9.md`.
+the chest wall. The threshold is gone and the file is no longer read.
 
 All noise is seeded per patient and per dose, so the noisy arrays are
 reproducible regardless of run order or interruptions.
