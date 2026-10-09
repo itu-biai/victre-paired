@@ -3,7 +3,7 @@
 Reproduction code for **VICTRE-Paired**, an open dataset for limited-angle
 digital breast tomosynthesis (DBT) reconstruction. Each sample pairs the 25 raw
 Monte-Carlo projections of a virtual patient with the reconstructed volume, and
-adds phantom-accurate lesion locations, control regions, three dose levels, and
+adds phantom-accurate lesion locations, control regions, three photon budgets, and
 the full projection geometry needed to run a forward/adjoint operator.
 
 The dataset is derived from the public [VICTRE in-silico
@@ -21,15 +21,19 @@ from existing VICTRE-derived resources, which target detection and segmentation.
 | Property | Value |
 |---|---|
 | Patients | 2761 (train 2208 / val 276 / test 277) |
-| Chunks | 348 `.npz` files, 8 patients each |
-| Projections | 25 views, ±25°, 752 × 384 (Monte-Carlo, flat-field corrected) |
-| Reconstruction | FBP volume, 56 × 408 × 336, 0.34 × 0.34 × 1.0 mm |
-| Dose levels | full / half / quarter (intensity-domain Poisson + electronic) |
+| Chunks | `.npz` files named `{split}_s{shard}_chunk_{NNNNN}.npz`, up to 8 patients each (a few shard-final chunks hold fewer) |
+| Projections | 25 views, ±25°, 752 × 384 (Monte-Carlo, corrected with an estimated flat field — see Flat-field below) |
+| Reconstruction | FBP volume, 56 × 408 × 336; 0.34 × 0.34 mm in-plane, slice thickness `native_z / 56` mm (0.68–1.11 mm by density) |
+| Photon budgets | three — 1,000 / 500 / 250 photons per 0.34 mm pixel per view (`full` / `half` / `quarter`); Poisson + 2-photon Gaussian, generated from the released `clean_proj`. These are relative noise levels, not calibrated clinical doses |
 | Lesions | phantom-accurate coordinates; mass and calcification types |
 | Control ROIs | matched signal-absent regions in negative patients |
 | Densities | fatty, scattered, heterogeneous, dense |
-| Size | ~115 GB |
 | License | data: CC BY 4.0 · code: MIT · source: CC BY 3.0 |
+
+`format_version` in every chunk identifies the data format; `changes_from_v8`
+carries a one-line summary of what the current format changed, so a loaded record
+states its own provenance. `src/CHANGELOG_v9.md` has the measurement behind each
+change.
 
 Two reconstruction regimes are supported (see [Two regimes](#two-regimes-inverse-crime)):
 an **inverse-crime** regime driven by synthetic forward projections `A(clean)`,
@@ -38,19 +42,22 @@ and an **inverse-crime-free** regime driven by the real Monte-Carlo projections
 
 ### Chunk contents (`.npz` keys)
 
-Each chunk holds 8 patients (first axis). Reconstruction arrays are
-`(8, 56, 408, 336)`, projection arrays are `(8, 25, 752, 384)`. Volumes,
-projections and mask are stored as `uint16`/`uint8` to save space; divide by
-`65535` (or `255` for the mask) to recover the `[0, 1]` range.
+Each chunk holds up to 8 patients (first axis). Reconstruction arrays are
+`(8, 56, 408, 336)`, projection arrays are `(8, 25, 752, 384)`. `clean` and
+`clean_proj` are stored as `uint16`; divide by `65535` to recover the `[0, 1]`
+range. `mask` is `uint8` with values 0 or 1 (no scaling). The **noisy projections use
+a different encoding**: `p = (u16 − 5000) × 5e-5`, i.e. the range
+`noisy_range = [−0.25, 3.02675]`, so that air can be negative (no clipping
+pedestal) and the thickest tissue cannot saturate. Values outside the
+illuminated detector area are stored exactly at the zero level 5000.
 
 | Key | Shape | dtype | Description |
 |---|---|---|---|
-| `clean` | (8, 56, 408, 336) | uint16 | FBP reconstruction (reference), 99.5-percentile normalized |
-| `clean_proj` | (8, 25, 752, 384) | uint16 | real MC projections, `log(ff) − log(I)` domain, **not shifted** |
-| `mask` | (8, 56, 408, 336) | uint8 | breast mask = `clean > 0.08` |
-| `noisy_proj` | (8, 25, 752, 384) | uint16 | noisy projections, **half dose** (default) |
-| `noisy_proj_full` / `noisy_proj_quarter` | (8, 25, 752, 384) | uint16 | full / quarter dose |
-| `sigma` / `sigma_full` / `sigma_quarter` | (8,) | float32 | measured noise std per dose |
+| `clean` | (8, 56, 408, 336) | uint16 | FBP reconstruction (reference), normalised by its **maximum** — nothing is clipped |
+| `clean_proj` | (8, 25, 752, 384) | uint16 | real MC projections, `log(ff) − log(I)` domain, normalised by its **maximum**, **not shifted** |
+| `mask` | (8, 56, 408, 336) | uint8 | breast mask = `clean > 0.08 * p99.5(clean)` (see below) |
+| `noisy_proj_full` / `noisy_proj_half` / `noisy_proj_quarter` | (8, 25, 752, 384) | uint16 | noisy projections at 1,000 / 500 / 250 photons. **Decode with `(u16 − 5000) × 5e-5`**, not `/65535` |
+| `sigma_full` / `sigma_half` / `sigma_quarter` | (8,) | float32 | measured noise std per budget, `std(noisy − clean)` on `clean_proj > 0.02` |
 | `is_pos` | (8,) | bool | signal-present flag (from `.loc` file type) |
 | `seed` | (8,) | int64 | VICTRE phantom SEED (patient id) |
 | `density` | (8,) | str | fatty / scattered / heterogeneous / dense |
@@ -59,14 +66,30 @@ projections and mask are stored as `uint16`/`uint8` to save space; divide by
 | `lesion_count` | (8,) | int16 | number of valid lesions |
 | `control_rois` | (8, 12, 5) | float32 | control regions: `[z, h, w, roi_id, in_bounds]` |
 | `control_count` | (8,) | int16 | number of valid control ROIs |
-| `recon_scale` / `proj_scale` | (8,) | float32 | per-patient normalization factors |
-| `noise_seed` | (8,) | int64 | per-patient noise seed (= `seed`) |
+| `recon_scale` / `proj_scale` | (8,) | float32 | per-patient normalisation factors; each is the **maximum** of the corresponding array |
+| `noise_seed` | (8,) | int64 | per-patient noise seed (= `seed`); rng = `default_rng(noise_seed·10 + dose_idx)` |
 | `geom_vox_z` | (8,) | float32 | voxel z-size = `native_z / 56` |
 | `geom_offx` / `geom_offy` / `geom_offz` | (8,) | float32 | volume offsets for the projection geometry |
-| `strip_valley` | (8,) | float32 | per-patient penumbra-strip threshold |
+| `recon_source_saturated` | (8,) | float32 | fraction of voxels at the uint16 ceiling in the **source** reconstruction DICOMs — the archive's own clipping, not this pipeline's |
 | `sid` / `sdd` / `det_pix` | () | float32 | 600.0 / 650.0 / 0.34 (constant across the dataset) |
-| `elec_noise` | () | float32 | electronic noise std (0.010) |
-| `dose_levels` / `dose_gains` | (3,) | float32 | `[1, 0.5, 0.25]` / `[0.001, 0.002, 0.004]` |
+| `elec_noise_photons` | () | float32 | Gaussian electronic noise std, in photons (2.0) |
+| `noisy_range` | (2,) | float32 | `[−0.25, 3.02675]`: decoded range of the `noisy_proj*` arrays |
+| `dose_levels` / `dose_gains` | (3,) | str / float32 | `["full", "half", "quarter"]` / `[0.001, 0.002, 0.004]` |
+| `format_version` | () | str | data format identifier |
+| `changes_from_v8` | () | str | one-line summary of what this format changed, so a loaded chunk states its own provenance |
+
+**The mask threshold is a formula, not a constant.** `MASK_THR = 0.08` is applied
+to the *normalised* volume, so its physical level depends on the normalisation
+divisor. Because this format divides by the maximum rather than a percentile, a
+literal 0.08 would sit about 1.8x higher than in the previous format; measured, it
+removed 14.3 % of the mask volume on average (20.4 % worst, concentrated in dense
+breasts). The threshold is therefore anchored to the same percentile:
+
+```python
+mask = clean > 0.08 * np.percentile(clean, 99.5)   # percentile over the WHOLE volume
+```
+
+recomputable from the released array alone, so no extra field is stored.
 
 Lesion `type` follows VICTRE: 0–3 are microcalcification clusters, 4–7 are masses.
 **Masses are resolvable; microcalcifications are not** at this resolution (see
@@ -89,14 +112,33 @@ victre-paired/
 ├── LICENSE
 ├── .gitignore
 └── src/
-    ├── constants.py            shared geometry / dose / split parameters
+    ├── constants.py            shared geometry / noise / split parameters
+    ├── noise.py                noise model: regenerate / encode / decode noisy_proj*
+    ├── estimate_flatfield.py   estimate the flat field from air regions -> flatfield/
+    ├── fit_delta.py            re-fit the per-density z offset and report the residual
+    ├── evaluate.py             THE reference evaluation for anyone reusing the data
     ├── generate_dataset.py     build the dataset from VICTRE source data
+    ├── export_splits.py        write splits.csv (seed,split) from a released copy
+    ├── splits.csv              released train/val/test membership (read by generate_dataset.py)
     ├── validate_dataset.py     technical validation (integrity + physics + baselines)
     ├── geometry.py             LEAP forward / adjoint operators from geom_* fields
+    │                            `geometry_from_chunk(d, i)` builds one directly
+    │                            from a loaded chunk's geom_* arrays
     ├── run_baselines.py        two-regime reconstruction (9 methods) -> baseline_raw.csv
     └── figures/
-        ├── make_baseline_figures.py   baseline_raw.csv -> Table 3 + F5/F5b/F5c/F6
+        ├── make_baseline_figures.py   baseline_raw.csv -> T3_baseline + F5/F5b/F5c/F6
         └── make_dataset_figures.py    validate_dataset.py's tables -> F1/F2/F3/F4/F6/F7
+```
+
+**Reusing the dataset?** `src/evaluate.py` is the entry point: give it a directory
+of `<seed>.npy` reconstructions and it reports the same metrics the paper reports,
+computed the same way — agreement after one documented affine fit inside the breast
+mask, and detection (AUC, d', control SDNR) on the matched positions, with intervals
+bootstrapped over positions. Numbers produced any other way are not comparable to
+the paper's baseline table.
+
+```bash
+python src/evaluate.py --data /path/to/victre-paired --pred ./my_recons --name my-method
 ```
 
 `run_baselines.py` only reconstructs and scores (needs a GPU); the two
@@ -132,10 +174,12 @@ pip install ./LEAP
 ```python
 import numpy as np
 
-d = np.load("test/test_chunk_00000.npz")
+d = np.load("test/test_s0_chunk_00000.npz")
 clean      = d["clean"].astype(np.float32) / 65535      # (8, 56, 408, 336) reference
 clean_proj = d["clean_proj"].astype(np.float32) / 65535 # (8, 25, 752, 384) real MC projections
-noisy_proj = d["noisy_proj"].astype(np.float32) / 65535 # (8, 25, 752, 384) half-dose
+
+# the noisy arrays use their OWN quantisation -- /65535 here would be wrong
+noisy_proj = (d["noisy_proj_half"].astype(np.float32) - 5000) * 5e-5   # 500 photons
 
 # lesions of the first patient
 n       = int(d["lesion_count"][0])
@@ -164,38 +208,62 @@ recon = G.fbp(clean_proj[i])                 # or G.sirt(clean_proj[i], n=50), G
 
 ### Reproducing the stored noise
 
-Noise is generated in the intensity domain and is bit-exactly reproducible from
-`noise_seed`:
+Noise is generated in the intensity domain **from the released `clean_proj`**, so
+every `noisy_proj*` array regenerates bit-for-bit from the record (`src/noise.py`):
 
 ```python
-def add_noise(p, proj_scale, gain, noise_seed, dose_idx, s_elec=0.010):
-    r  = np.random.default_rng(np.uint64(noise_seed) * 10 + np.uint64(dose_idx))
-    I0 = 1.0 / gain
-    I  = I0 * np.exp(-np.clip(p, 0, 1) * proj_scale)     # transmitted photons
-    N  = r.poisson(np.maximum(I, 1e-9)).astype(np.float64)
-    N += r.standard_normal(p.shape) * (s_elec * I0 * 0.02)
-    return np.clip(-np.log(np.maximum(N, 1e-9) / I0) / proj_scale, 0, 1)
-
-# dose_idx: 0 = full, 1 = half, 2 = quarter
+from src.noise import regenerate, decode
+u16 = regenerate(d["clean_proj"][i], float(d["proj_scale"][i]), int(d["seed"][i]), "half")
+assert np.array_equal(u16, d["noisy_proj_half"][i])
+noisy = decode(d["noisy_proj_half"][i])       # float32 log-attenuation, (25, 752, 384)
 ```
+
+Model: `I0 = 1/gain` photons per pixel per view (1 000 / 500 / 250),
+`I = I0·exp(−p·proj_scale)`, `N ~ Poisson(I) + N(0, 2 photons)`,
+`p_noisy = −log(max(N, 0.5)/I0)/proj_scale` inside the illuminated bounding
+box of `clean_proj > 0`; rng `default_rng(seed·10 + dose_idx)`, dose_idx
+full:0 half:1 quarter:2. The budgets are relative noise levels, roughly two
+orders of magnitude below clinical air-side counts, chosen to give visible noise
+at this pixel size.
 
 ---
 
 ## Reproducing the dataset
 
-Generation is designed to run across five Google Colab sessions in parallel
-(the train split is produced in three shards). In `src/generate_dataset.py` set
+Generation runs per split and can be sharded across machines:
 
-```python
-RUN_MODE = "train_1"   # then "train_2", "train_3", "val", "test" in other sessions
+```bash
+python src/generate_dataset.py --split train --shard 0 --n-shards 3   # and shards 1, 2
+python src/generate_dataset.py --split val
+python src/generate_dataset.py --split test
 ```
 
-and run. Completed chunks are skipped, so interrupted runs can be restarted.
-Paths at the top of the script point to a Google Drive mount and should be
-adapted to your environment. The split is deterministic (`SEED_SPLIT = 42`) and
-read from the VICTRE source assignment — it is not re-shuffled. All noise is
-seeded per patient and per dose, so the entire dataset is reproducible
-regardless of run order or interruptions.
+Completed chunks are skipped, so interrupted runs can be restarted. Paths at the
+top of the script (`SOURCE_ROOT`, `LOC_ROOT`, `FLATFIELD_DIR`, `OUTPUT_ROOT`)
+should be adapted to your environment.
+
+**Split assignment.** The released train/val/test membership is a fixed
+patient-level list, `splits.csv` (`seed,split`), which `generate_dataset.py`
+reads when present next to `constants.py`. It can be regenerated from a copy of
+the released dataset with `python src/export_splits.py --data /path/to/victre-paired`.
+Without `splits.csv` the script falls back to a deterministic 80/10/10 hash of
+the seed, which does **not** reproduce the released membership.
+
+**Flat-field.** The true VICTRE flat-field is not published. Generation needs
+two estimated inputs in `FLATFIELD_DIR`: `ff_base.npy` (per-view base
+flat-field, 25 × 3000 × 1500) and `coefficients.json` (per-density, per-view
+polynomial correction). Their estimation is described in the paper (Methods,
+Projections); the files used for the released record accompany the data
+repository.
+
+A third file, `valley.json`, was read by the previous format: a per-density
+attenuation threshold above which pixels were zeroed, on the assumption that they
+were a collimator penumbra. They were not — they were the thickest tissue against
+the chest wall. The threshold is gone and the file is no longer read; the
+measurements behind that are in `src/CHANGELOG_v9.md`.
+
+All noise is seeded per patient and per dose, so the noisy arrays are
+reproducible regardless of run order or interruptions.
 
 ---
 
@@ -211,18 +279,21 @@ stratified sample for the heavy per-array measurements:
 
 - **Integrity** — schema, dtypes, shapes, constants, no NaN/Inf, no duplicate
   seeds, split disjointness, and the analytic geometry formula (all 2761 patients).
-- **Normalization** — `clean` 99.5-percentile = 1.0, `clean_proj` 99.8-percentile = 1.0.
+- **Normalisation** — `clean` and `clean_proj` are each divided by their own
+  maximum and nothing is clipped, so exactly one sample per patient sits at the
+  uint16 ceiling by construction. Recover physical units with `recon_scale` /
+  `proj_scale`.
 - **Flat-field** — air attenuation ≈ 0 (physical requirement), angular uniformity
   ≈ 1/cos 25° = 1.10.
 - **Noise** — measured vs. stored `sigma`, dose monotonicity, whiteness, and
-  **bit-exact reproduction** of every `noisy_proj` array from `noise_seed`.
+  **bit-exact reproduction** of every `noisy_proj*` array from `noise_seed`.
 - **Geometry** — residual parallax between `A(clean)` and `clean_proj` (needs a GPU).
 - **Task-based** — mass/control SDNR, d′, AUC; unbiased-estimator check on control ROIs.
 
 It writes `report.md` / `results.json` reproducing the numbers in the paper's
 Technical Validation section, plus per-patient tables under `tables/`.
-`figures/make_dataset_figures.py` turns those tables into the paper's F1–F4
-figures (and F6/F7 if stages 7/9 were run) and does not itself need a GPU.
+`figures/make_dataset_figures.py` turns those tables into the validation figures
+F1–F4 (and F6/F7 if stages 7/9 were run) and does not itself need a GPU.
 
 ---
 
@@ -245,14 +316,12 @@ itself produce tables or figures.
 pass `--data`, the `F6_gallery_*` reconstruction gallery). This step needs no
 GPU except for the optional F6 gallery.
 
-FBP is implemented from scratch (Hann-windowed ramp filter, edge-replicate
-padding, approximate cosine weighting) rather than adapted from VICTRE's own
-GPL-licensed reconstruction code, which is neither read nor copied here. Two
-built-in LEAP FBP routes were tried and rejected during development: `L.FBP()`
-returns a degenerate result on this modular-beam geometry, and
-`L.filterProjections()` is a silent no-op here (its output is numerically
-identical to unfiltered back-projection) — a reminder to sanity-check library
-routines against a known baseline (e.g. Aᵀp) before trusting them.
+FBP is implemented in `geometry.py` (Hann-windowed ramp filter, edge-replicate
+padding, approximate cosine weighting, back-projection through LEAP's adjoint)
+rather than adapted from VICTRE's own GPL-licensed reconstruction code, which is
+neither read nor copied here. LEAP's built-in `FBP()` / `filterProjections()`
+are not used: on this modular-beam geometry they did not produce a usable
+filtered reconstruction in our hands.
 
 **Metrics.** Per reconstruction: breast-masked correlation (**primary**),
 scale-matched PSNR, SSIM, RMSE, and mass SDNR. Whole-volume PSNR/correlation are
@@ -309,8 +378,8 @@ reconstructor can target.
 - Microcalcifications are below the resolving limit at this resolution; use
   masses for lesion tasks.
 - Class balance is inherited from VICTRE (fatty is the smallest class).
-- Dose labels are defined by an absolute photon budget (`I0 = 1/gain`), not
-  calibrated to clinical mGy.
+- The three noise levels are photon budgets (1 000 / 500 / 250 per 0.34 mm
+  pixel per view), not calibrated clinical doses.
 - One patient (SEED 208084664) has a degenerate VICTRE reconstruction; it is
   kept for completeness and excluded in evaluation via `BROKEN_SEEDS`.
 
