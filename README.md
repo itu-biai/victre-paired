@@ -27,7 +27,7 @@ acquisition geometry, lesion locations and matched signal-absent controls. The D
 | `dataset_test.py` | Validates every record (keys, shapes, noise injection) and computes baseline metrics on the chosen splits; writes `validation.md` and `preview.png`. |
 | `dbt_2026v1_manifest.csv` | Frozen splits of the 384-phantom development set; these phantoms keep their split. |
 | `notebooks/` | Google Colab notebooks that generated the release and produced every figure, table and number of the Data Descriptor (below). |
-| `notebooks/build/` | The scripts that write the notebooks (`python3 build_01_analysis.py 01_analysis_colab.ipynb`); edit these, not the notebooks. |
+| `notebooks/generators/` | The scripts that write the notebooks (`python3 build_01_analysis.py 01_analysis_colab.ipynb`); edit these, not the notebooks. |
 
 ### Notebooks
 
