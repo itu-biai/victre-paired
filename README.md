@@ -26,6 +26,23 @@ acquisition geometry, lesion locations and matched signal-absent controls. The D
 | `dataset_generate.py` | Downloads the VICTRE source data and writes every record (resumable). |
 | `dataset_test.py` | Validates every record (keys, shapes, noise injection) and computes baseline metrics on the chosen splits; writes `validation.md` and `preview.png`. |
 | `dbt_2026v1_manifest.csv` | Frozen splits of the 384-phantom development set; these phantoms keep their split. |
+| `notebooks/` | Google Colab notebooks that generated the release and produced every figure, table and number of the Data Descriptor (below). |
+| `notebooks/build/` | The scripts that write the notebooks (`python3 build_01_analysis.py 01_analysis_colab.ipynb`); edit these, not the notebooks. |
+
+### Notebooks
+
+| notebook | GPU | what it does |
+|---|---|---|
+| `00_generation_colab.ipynb` | yes | Runs `dataset_generate.py` over the collection in resumable sessions, then `dataset_test.py`, then writes `manifest.csv`. |
+| `01_analysis_colab.ipynb` | yes | Registry of the release, DELTA check of every file, and per-phantom baselines, detection, depth alignment, noise and data fit on the test split. |
+| `02_figures_tables_colab.ipynb` | no | Every figure, table and number of the Data Descriptor (`numbers.tex`), from the outputs of 01, 03–06. |
+| `03_extra_analysis_colab.ipynb` | yes | Four classical methods × three doses × two projection sources (Monte Carlo and synthetic), noise spectra, forward-model residuals; SART pass count and SART-TV weight chosen on the validation split. |
+| `04_training_colab.ipynb` | yes | A small supervised U-Net experiment showing that the training split is usable (supplementary material). |
+| `05_diagnostics_colab.ipynb` | yes | Diagnostics of depth alignment, scale, noise ratio and zero voxels of the reference. |
+| `06_delta_colab.ipynb` | yes | Checks the volume-height constant `DELTA` against VICTRE's own reconstruction. |
+| `07_delta_patch_colab.ipynb` | yes | Recomputes `sart_full`, `breast_mask` and `volume_box_mm` of the dense, heterogeneous and scattered records with the corrected `DELTA`. |
+
+The notebooks read the scripts and the data from Google Drive; the paths are set in their first cells.
 
 ## Usage
 
