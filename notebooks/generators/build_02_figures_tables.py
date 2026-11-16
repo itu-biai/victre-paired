@@ -867,7 +867,7 @@ rows = [("Views", f"{NV}, uniform over $\\pm{ANG:g}^\\circ$"), ("Source to rotat
                                          f"{CFGJ.get('sart_depth_margin_slices', 8)} margin slices above and below")]
 rows += [(f"{DNAME[dn]}: slices, $\\Delta$", f"{SLC[dn]}, {DELTA[dn]:.3f} mm") for dn in DENS]
 rows += [("$\\Delta$ from the trial's code", f"20.0 mm object-to-detector distance less 0.5 mm, half the cover: {DELTA_PUB:.3f} mm")]
-write_table("tabS2_geometry", "dataset_generate.py, config.json", "\\textbf{All density classes share one acquisition geometry and the same detector offset $\\Delta$.} Acquisition geometry and reconstruction constants of the release.",
+write_table("tabS2_geometry", "dataset_generate.py, config.json", "\\textbf{All density classes share one acquisition geometry and the same height $\\Delta$ of the volume above the detector.} Acquisition geometry and reconstruction constants of the release.",
             "tab:S2", "@{}ll@{}", [r"Quantity & Value \\"], [[a, b] for a, b in rows])
 
 # ------------------------------------------------------------ S3: training table
