@@ -33,7 +33,7 @@ If the session drops: **A → B →** the cell where you stopped. **First a tria
 
 **Scope:** reporting only. The place of the learned method in the ranking is not interpreted in the Data Descriptor.
 
-Outputs: `/content/drive/MyDrive/New_DBT/VICTRE-PAIRED-v11_analysis/training/`
+Outputs: `/content/drive/MyDrive/victre_paired/analysis/training/`
 """)
 
 md("## A · Setup")
@@ -61,8 +61,8 @@ import torch, torch.nn as nn, torch.nn.functional as F
 from scipy import ndimage
 
 NB_DIR = Path("/content/drive/MyDrive/victre_paired/code")
-DATA   = Path("/content/drive/MyDrive/New_DBT/VICTRE-PAIRED-v11")
-RES    = Path("/content/drive/MyDrive/New_DBT/VICTRE-PAIRED-v11_analysis")
+DATA   = Path("/content/drive/MyDrive/victre_paired/data")
+RES    = Path("/content/drive/MyDrive/victre_paired/analysis")
 EG     = RES/"training"
 
 TRIAL          = False            # True: 2 phantoms/density, 300 steps, 3 test phantoms

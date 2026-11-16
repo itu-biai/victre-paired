@@ -11,7 +11,7 @@ md(r"""
 # VICTRE-Paired v11 — diagnostics (Colab, GPU, ~1 h)
 
 Four questions that came up when reviewing the first output of 02. None changes the dataset; all decide
-**what the paper states**. Outputs in `VICTRE-PAIRED-v11_analysis/diagnostics/`, read by 02.
+**what the paper states**. Outputs in `analysis/diagnostics/`, read by 02.
 
 | | cell | question | time |
 |---|---|---|---|
@@ -53,8 +53,8 @@ from scipy import ndimage
 import concurrent.futures as _cf
 
 NB_DIR = Path("/content/drive/MyDrive/victre_paired/code")
-DATA   = Path("/content/drive/MyDrive/New_DBT/VICTRE-PAIRED-v11")
-RES    = Path("/content/drive/MyDrive/New_DBT/VICTRE-PAIRED-v11_analysis")
+DATA   = Path("/content/drive/MyDrive/victre_paired/data")
+RES    = Path("/content/drive/MyDrive/victre_paired/analysis")
 DIAG   = RES/"diagnostics"
 
 N_S_PER_DEN = 2       # D and E: phantoms per density (test, those with victre_fbp and lesions preferred)

@@ -73,7 +73,7 @@ from scipy import ndimage
 import concurrent.futures as _cf
 
 NB_DIR = Path("/content/drive/MyDrive/victre_paired/code")
-DATA   = Path("/content/drive/MyDrive/New_DBT/VICTRE-PAIRED-v10")
+DATA   = Path("/content/drive/MyDrive/victre_paired/data")
 LOCAL  = Path("/content/patch")
 
 SESSION, N_SESSIONS = 0, 1        # parallel tabs: 0..N-1, the same N in all

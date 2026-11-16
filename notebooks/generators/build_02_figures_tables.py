@@ -56,8 +56,8 @@ from scipy import ndimage
 from scipy.stats import rankdata
 
 GEN  = Path("/content/drive/MyDrive/victre_paired/code/dataset_generate.py")   # the constants are read from here
-DATA = Path("/content/drive/MyDrive/New_DBT/VICTRE-PAIRED-v11")
-RES  = Path("/content/drive/MyDrive/New_DBT/VICTRE-PAIRED-v11_analysis")
+DATA = Path("/content/drive/MyDrive/victre_paired/data")
+RES  = Path("/content/drive/MyDrive/victre_paired/analysis")
 FIG, TAB, THUMB = RES/"FIGURES", RES/"TABLES", RES/"FIGURES"/"fig1_thumbs"
 for d in (FIG, TAB, THUMB): d.mkdir(parents=True, exist_ok=True)
 
@@ -314,7 +314,7 @@ if need("tab2_composition", K):
             body.append([({"train": "Train", "val": "Validation", "test": "Test"}[s] if i == 0 else "")] + row(DNAME[dn], Rs[Rs.density == dn]))
         body.append(["", ] + row("\\textit{all}", Rs)); body.append("MIDRULE")
     body.append(["\\textbf{Total}"] + row("", K))
-    write_table("tab2_composition", "VICTRE-PAIRED-v11_analysis/registry.csv",
+    write_table("tab2_composition", "analysis/registry.csv",
         f"\\textbf{{The release holds {tex_int(len(K))} phantoms in frozen training, validation and test splits.}} Phantoms are counted as signal present / signal absent. Masses and "
         "calcification clusters are the trial's insertions in signal-present phantoms; controls are the trial's "
         "matched lesion-free positions in signal-absent phantoms. \\texttt{victre\\_fbp} counts the phantoms "
@@ -346,7 +346,7 @@ if need("tab3_classical", EM, ES):
             f"$\\alpha={SETTINGS['tv_alpha']:g}$, both chosen on validation phantoms. ") if SETTINGS else ""
     if SETTINGS:
         NUM["SARTIterations"] = str(SETTINGS["sart_iterations"]); NUM["TVAlpha"] = f"{SETTINGS['tv_alpha']:g}"
-    write_table("tab3_classical", "VICTRE-PAIRED-v11_analysis/extra_metrics.csv, extra_sdnr.csv",
+    write_table("tab3_classical", "analysis/extra_metrics.csv, extra_sdnr.csv",
         f"\\textbf{{PSNR against $x_\\mathrm{{ref}}$ falls with dose for every classical reconstructor.}} Monte Carlo projections, test split, $n={n}$ phantoms. "
         "PSNR (dB, mean $\\pm$ s.d. over phantoms) and SSIM (\\%) against $x_\\mathrm{ref}$ inside the breast "
         "mask after a least-squares gain and offset, as in \\texttt{dataset\\_test.py}; mass SDNR at 25\\,\\% dose. "
@@ -381,7 +381,7 @@ if need("tab4_source", EM):
         NUM[f"RankMC{MW[m]}"] = str(rk["mc"][m])
         if np.isfinite(r["vf"]): NUM[f"CorrVFBP{MW[m]}TwentyFive"] = f"{r['vf']:.3f}"
     nvf = g[(g.source == "mc") & g.corr_vf.notna()].patient.nunique(); NUM["NtestVFBPEk"] = tex_int(nvf)
-    write_table("tab4_source", "VICTRE-PAIRED-v11_analysis/extra_metrics.csv, training_metrics.csv",
+    write_table("tab4_source", "analysis/extra_metrics.csv, training_metrics.csv",
         "\\textbf{Classical and supervised baselines at 25\\,\\% dose under two projection sources.} Test split. Synthetic projections are "
         "the noiseless $A x_\\mathrm{ref}$ (no gain, clipped at zero, on the breast footprint and valid rays) with noise drawn directly at the dose, mean $fN_0e^{-p}$ and variance $fN_0e^{-p}+\\sigma_e^2$; Monte Carlo projections are the trial's "
         "(\\texttt{proj\\_25}). PSNR (dB) against $x_\\mathrm{ref}$ and the rank among the methods listed. "
@@ -856,7 +856,7 @@ if need("tabS1_classical_density", EM):
             body.append(r)
         body.append("MIDRULE")
     body = body[:-1]
-    write_table("tabS1_classical_density", "VICTRE-PAIRED-v11_analysis/extra_metrics.csv",
+    write_table("tabS1_classical_density", "analysis/extra_metrics.csv",
         "\\textbf{PSNR against $x_\\mathrm{ref}$ falls with dose for every classical reconstructor in every density class.} Table 3 by density class. PSNR (dB, mean $\\pm$ s.d. over phantoms) against $x_\\mathrm{ref}$, Monte Carlo projections, test split.",
         "tab:S1", "llccc", ["Density & Method & " + " & ".join(f"{k}\\,\\%" for k in DOSES) + r" \\"], body)
 
@@ -882,7 +882,7 @@ if need("tabS3_training", TM, TS):
         r.append(f"{s[s.dose == '25'].sdnr.mean():.2f}"); body.append(r)
         if td:
             for k in DOSES: NUM[f"PSNRUNet{DOSEW[td]}On{DOSEW[k]}"] = f"{g[g.dose == k].psnr.mean():.2f}"
-    write_table("tabS3_training", "VICTRE-PAIRED-v11_analysis/training_metrics.csv, training_sdnr.csv",
+    write_table("tabS3_training", "analysis/training_metrics.csv, training_sdnr.csv",
         "\\textbf{A supervised U-Net trained on the training split, scored on the test split.} A 2D U-Net maps the low-dose OS-SART reconstruction to $x_\\mathrm{ref}$ "
         "(masked squared error, residual learning), trained on the training split. "
         "PSNR (dB) / SSIM (\\%) against $x_\\mathrm{ref}$ at each test dose, Monte Carlo projections; mass SDNR at 25\\,\\%. "
@@ -902,7 +902,7 @@ if need("tabS4_task", SD):
                      f"${g[g.kind == -1].sdnr.mean():+.3f}$", f"{a:.3f} [{lo:.3f}, {hi:.3f}]", f"{nm}/{nc}"])
         NUM[f"AUC{mm}{DOSEW[d]}"] = f"{a:.3f}"; NUM[f"SDNRCtrl{mm}{DOSEW[d]}"] = f"{g[g.kind == -1].sdnr.mean():+.3f}"
         if mm == "VFBP": body.append("MIDRULE")
-    write_table("tabS4_task", "VICTRE-PAIRED-v11_analysis/sdnr.csv",
+    write_table("tabS4_task", "analysis/sdnr.csv",
         "\\textbf{At the stored positions, mass SDNR exceeds that of matched controls in every volume; controls give SDNR near zero.} Test split. SDNR: mean of a $3\\times9\\times9$-voxel core minus the mean of a $25\\times25$ window in the centre slice (core included), "
         "over the s.d. of that window, at each stored position. AUC: masses against controls, "
         "95\\,\\% interval from a bootstrap over phantoms. The \\texttt{victre\\_fbp} row uses the phantoms that carry it. "

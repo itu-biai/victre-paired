@@ -40,7 +40,7 @@ the Data Descriptor states this in one sentence and gives the second reference (
 **D resumes where it stopped** (`extra/phantoms/<id>.json`). If the session drops: **A → B → D**.
 Two tabs: `SESSION = 0/1`, `N_SESSIONS = 2`. **First a trial:** C → D → E with `TRIAL = 3`.
 
-Outputs: `/content/drive/MyDrive/New_DBT/VICTRE-PAIRED-v11_analysis/extra/`
+Outputs: `/content/drive/MyDrive/victre_paired/analysis/extra/`
 """)
 
 md("## A · Setup")
@@ -71,8 +71,8 @@ import torch
 from scipy import ndimage
 
 NB_DIR = Path("/content/drive/MyDrive/victre_paired/code")
-DATA   = Path("/content/drive/MyDrive/New_DBT/VICTRE-PAIRED-v11")
-RES    = Path("/content/drive/MyDrive/New_DBT/VICTRE-PAIRED-v11_analysis")
+DATA   = Path("/content/drive/MyDrive/victre_paired/data")
+RES    = Path("/content/drive/MyDrive/victre_paired/analysis")
 EK     = RES/"extra"
 
 TRIAL     = 0        # >0: only this many test phantoms (trial). 0: all

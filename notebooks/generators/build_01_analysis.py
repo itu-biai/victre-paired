@@ -29,7 +29,7 @@ If the session drops, run **A → B → D** again. For two parallel tabs, `SESSI
 **First a trial:** run D with `TRIAL = 3`, run E, then run notebook `02`.
 If everything comes out, set `TRIAL = 0` and run all of it (the trial phantoms are not recomputed).
 
-Outputs: `/content/drive/MyDrive/New_DBT/VICTRE-PAIRED-v11_analysis/`
+Outputs: `/content/drive/MyDrive/victre_paired/analysis/`
 """)
 
 md("## A · Setup")
@@ -61,8 +61,8 @@ from pathlib import Path
 import numpy as np
 
 NB_DIR = Path("/content/drive/MyDrive/victre_paired/code")                     # generation scripts
-DATA   = Path("/content/drive/MyDrive/New_DBT/VICTRE-PAIRED-v11")      # dataset
-RES    = Path("/content/drive/MyDrive/New_DBT/VICTRE-PAIRED-v11_analysis")   # output of this notebook
+DATA   = Path("/content/drive/MyDrive/victre_paired/data")      # dataset
+RES    = Path("/content/drive/MyDrive/victre_paired/analysis")   # output of this notebook
 
 SPLIT      = "test"   # split for the baseline/detection/z analysis
 TRIAL     = 0        # >0: only this many phantoms (trial). 0: all

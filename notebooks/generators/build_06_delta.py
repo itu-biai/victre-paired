@@ -26,7 +26,7 @@ VICTRE's. This notebook tests this with two **lesion-independent** measurements.
 | **F** | decision | `delta/summary.json` and a plain-language result | — |
 
 **Expected (if 19.5 is right):** in C an offset of hetero ≈ −0.9, scattered ≈ −0.6 slices; in D
-the DELTA that zeroes the offset ≈ 19.5 in every class. Does not change the dataset; output in `VICTRE-PAIRED-v11_analysis/delta/`.
+the DELTA that zeroes the offset ≈ 19.5 in every class. Does not change the dataset; output in `analysis/delta/`.
 """)
 
 md("## A · Setup")
@@ -55,8 +55,8 @@ from scipy import ndimage
 import concurrent.futures as _cf
 
 NB_DIR = Path("/content/drive/MyDrive/victre_paired/code")
-DATA   = Path("/content/drive/MyDrive/New_DBT/VICTRE-PAIRED-v11")
-RES    = Path("/content/drive/MyDrive/New_DBT/VICTRE-PAIRED-v11_analysis")
+DATA   = Path("/content/drive/MyDrive/victre_paired/data")
+RES    = Path("/content/drive/MyDrive/victre_paired/analysis")
 OUTD   = RES/"delta"
 
 N_D      = 6                          # D: phantoms per density
