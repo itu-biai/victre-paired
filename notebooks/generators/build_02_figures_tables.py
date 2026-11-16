@@ -861,13 +861,13 @@ if need("tabS1_classical_density", EM):
         "tab:S1", "llccc", ["Density & Method & " + " & ".join(f"{k}\\,\\%" for k in DOSES) + r" \\"], body)
 
 # ------------------------------------------------------------ S2: geometry constants
-rows = [("Views", f"{NV}, uniform over $\\pm{ANG:g}^\\circ$"), ("Source to rotation axis / detector", f"{SIDc:g} / {SDDc:g} mm"),
+rows = [("Views", f"{NV}, uniform over $\\pm{ANG:g}^\\circ$"), ("Source to centre of rotation / detector", f"{SIDc:g} / {SDDc:g} mm"),
         ("Detector", f"{DETR} $\\times$ {DETC} binned pixels of {PIX:.2f} mm"), ("Volume grid", f"$S \\times {VOLR} \\times {VOLC}$, {PIX:.2f} $\\times$ {PIX:.2f} $\\times$ 1 mm"),
         ("OS-SART for $x_\\mathrm{ref}$", f"{CFGJ.get('sart_iterations', 10)} iterations $\\times$ {CFGJ.get('sart_subsets', 5)} subsets, non-negative, "
                                          f"{CFGJ.get('sart_depth_margin_slices', 8)} margin slices above and below")]
 rows += [(f"{DNAME[dn]}: slices, $\\Delta$", f"{SLC[dn]}, {DELTA[dn]:.3f} mm") for dn in DENS]
 rows += [("$\\Delta$ from the trial's code", f"20.0 mm object-to-detector distance less 0.5 mm, half the cover: {DELTA_PUB:.3f} mm")]
-write_table("tabS2_geometry", "dataset_generate.py, config.json", "\\textbf{All density classes share one acquisition geometry and the same height $\\Delta$ of the volume above the detector.} Acquisition geometry and reconstruction constants of the release.",
+write_table("tabS2_geometry", "dataset_generate.py, config.json", "\\textbf{All density classes share one acquisition geometry and the same distance $\\Delta$ from the detector to the bottom of the reconstructed volume.} Acquisition geometry and reconstruction constants of the release.",
             "tab:S2", "@{}ll@{}", [r"Quantity & Value \\"], [[a, b] for a, b in rows])
 
 # ------------------------------------------------------------ S3: training table
