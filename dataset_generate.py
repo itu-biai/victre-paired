@@ -11,15 +11,15 @@
 # ]
 # ///
 """
-Generate VICTRE-Paired v11 from the VICTRE in-silico trial on TCIA.
+Generate VICTRE-Paired v11 from the VICTRE in silico trial on TCIA.
 
-For every eligible phantom the record holds the 25 Monte Carlo DBT projections and the mammogram
+For every eligible phantom, one file holds the 25 Monte Carlo DBT projections and the mammogram
 of VICTRE's Siemens Mammomat Inspiration model at full dose; low-dose versions at 50, 25 and 10 %
 dose, made by adding calibrated quantum and electronic noise in the pre-log intensity domain; an
 OS-SART reconstruction of the full-dose projections (`sart_full`, the primary reference x_ref);
 VICTRE's own reconstruction as a second reference (`victre_fbp`, where TCIA publishes it); and
 lesion locations from DIDSR/VICTRE with matched signal-absent controls. Phantoms of the
-development set (dbt_2026v1_manifest.csv) keep their frozen split.
+development set (dbt_2026v1_manifest.csv) keep their fixed split.
 
 The run is resumable: finished patients are skipped, failures are logged and retried
 on the next run, and progress.json is rewritten after every patient.
@@ -95,7 +95,7 @@ class Config:
     field_margin_px: int = 16
     breast_fraction: float = 0.85
     ring_px: tuple = (30, 120)
-    mask_threshold: float = 0.08         # fraction of the ground truth's breast p99.5
+    mask_threshold: float = 0.08         # fraction of the reference's breast p99.5
     lesion_radius_mm: float = 2.5
     sart_iterations: int = 10
     sart_subsets: int = 5
@@ -414,7 +414,7 @@ def breast_hull(geometry: Geometry, projections: np.ndarray, valid: np.ndarray) 
 
 
 def breast_mask(ground_truth: np.ndarray, hull: np.ndarray) -> np.ndarray:
-    """Projection hull (space carving) AND a smoothed ground truth above a fraction of its breast p99.5."""
+    """Projection hull (space carving) AND a smoothed reference x_ref above a fraction of its breast p99.5."""
     smooth = ndimage.uniform_filter(ground_truth, (1, 5, 5))
     level = np.percentile(smooth[hull], 99.5)
     return hull & (smooth > CFG.mask_threshold * level)
@@ -444,7 +444,7 @@ def lesion_roi(table: np.ndarray, shape: tuple[int, int, int]) -> np.ndarray:
 
 # ----------------------------------------------------------------------------- second reference
 def load_victre_fbp(pid: str, entry: dict, density: str, cache: Path):
-    """VICTRE's own reconstruction, resampled onto the record grid.
+    """VICTRE's own reconstruction, resampled onto the voxel grid of sart_full.
 
     This is NOT the ground truth and must not be used as one: it is a smoothed filtered
     back projection with an undocumented filter on an arbitrary intensity scale, and

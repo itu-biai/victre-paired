@@ -15,13 +15,13 @@
 """
 Validate a VICTRE-Paired release and compute baseline metrics.
 
-1. Checks keys, shapes and dtypes of every patient file.
-2. Checks the noise injection of every file: the extra noise variance measured in each
+1. Checks keys, shapes and dtypes of every phantom file.
+2. Checks the noise simulation of every file: the extra noise variance measured in each
    low-dose projection set, divided by the variance the noise model predicts from the stored
    photon count and electronic noise, should be 1.
 3. Reconstructs the low-dose projections of the metric splits with OS-SART (same algorithm as
-   the ground truth) and FBP and reports PSNR, SSIM and MSE against the ground truth inside
-   the breast, per dose, split and density.
+   the reference x_ref = sart_full) and FBP and reports PSNR, SSIM and MSE against x_ref inside
+   the breast, per dose, split and density. x_ref is a full-dose reconstruction, not the phantom.
 4. Writes validation.md (all tables) and preview.png (one signal-present patient per density).
 
 Usage (needs a CUDA GPU for ASTRA):
@@ -61,19 +61,19 @@ EXPECTED = {
 
 
 def normalize(volume: np.ndarray, reference: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Map to [0, 1] with the ground truth's breast p0.5-p99.5 window (same window for both inputs)."""
+    """Map to [0, 1] with the reference's breast p0.5-p99.5 window (same window for both inputs)."""
     lo, hi = np.percentile(reference[mask], [0.5, 99.5])
     return np.clip((volume - lo) / (hi - lo), 0, 1)
 
 
-def scale_match(pred: np.ndarray, gt: np.ndarray, mask: np.ndarray) -> np.ndarray:
+def scale_match(pred: np.ndarray, ref: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Least-squares a * pred + b inside the breast; FBP is not in mm^-1, SART nearly is."""
-    a, b = np.polyfit(pred[mask].astype(np.float64), gt[mask].astype(np.float64), 1)
+    a, b = np.polyfit(pred[mask].astype(np.float64), ref[mask].astype(np.float64), 1)
     return a * pred + b
 
 
-def metrics(pred: np.ndarray, gt: np.ndarray, mask: np.ndarray) -> dict[str, float]:
-    p, g = normalize(scale_match(pred, gt, mask), gt, mask), normalize(gt, gt, mask)
+def metrics(pred: np.ndarray, ref: np.ndarray, mask: np.ndarray) -> dict[str, float]:
+    p, g = normalize(scale_match(pred, ref, mask), ref, mask), normalize(ref, ref, mask)
     mse = float(np.mean((p[mask] - g[mask]) ** 2))
     ssim = []
     for z in range(g.shape[0]):
@@ -128,7 +128,7 @@ def check(data: np.lib.npyio.NpzFile, name: str) -> list[str]:
 def noise_ratios(data: np.lib.npyio.NpzFile) -> dict[str, float]:
     """Measured extra log-domain variance over the predicted (f(1-f)N + (1-f^2) sigma_e^2) / (fN)^2.
 
-    The injected noise is white, so the 4-neighbour residual measures it without bias, and
+    The added noise is white, so the 4-neighbour residual measures it without bias, and
     the full-dose noise cancels in the difference low minus full."""
     ratios = {}
     for prefix, expand, n0_key, sigma_key in (("proj", lambda a: a, "photons_per_pixel", "electronic_sigma"),
@@ -146,7 +146,7 @@ def noise_ratios(data: np.lib.npyio.NpzFile) -> dict[str, float]:
 
 
 def table(rows: dict, title: str) -> list[str]:
-    lines = [f"\n### {title}\n", "| Split | Density | Patients | PSNR | SSIM | MSE |", "|---|---|---|---|---|---|"]
+    lines = [f"\n### {title}\n", "| Split | Density | Phantoms | PSNR | SSIM | MSE |", "|---|---|---|---|---|---|"]
     for (split, density), values in sorted(rows.items(), key=lambda kv: (SPLITS.index(kv[0][0]) if kv[0][0] in SPLITS else 9,
                                                                          (("all",) + DENSITIES).index(kv[0][1]))):
         avg = {k: np.mean([v[k] for v in values]) for k in values[0]}
@@ -174,7 +174,7 @@ def preview(files: list[Path], out: Path) -> None:
             low = DOSES[-1]
             sart_low = geometry.os_sart(data[f"proj_{low}"].astype(np.float32), data["proj_valid"])
             panels = {"proj_full view 12": data["proj_full"][12], f"proj_{low} view 12": data[f"proj_{low}"][12],
-                      "sart_full (GT)": data["sart_full"][z], f"SART from {low}% dose": sart_low[z],
+                      "sart_full (x_ref)": data["sart_full"][z], f"SART from {low}% dose": sart_low[z],
                       "dm_full": data["dm_full"], f"dm_{DOSES[0]}": data[f"dm_{DOSES[0]}"], f"dm_{low}": data[f"dm_{low}"]}
             mask = data["breast_mask"][z]
             for index, (ax, (title, image)) in enumerate(zip(row, panels.items())):
@@ -235,32 +235,32 @@ def main() -> None:
                 second_ref["saturated"].append(float(data["victre_fbp_saturated"]))
             second_ref["present"].append(bool(data["victre_fbp_present"]))
 
-            density, gt, mask = str(data["density"]), data["sart_full"], data["breast_mask"]
-            geometry = Geometry(density, gt.shape[0])
+            density, ref, mask = str(data["density"]), data["sart_full"], data["breast_mask"]
+            geometry = Geometry(density, ref.shape[0])
             recons = {"FBP full dose": geometry.fbp(data["proj_full"].astype(np.float32))}
             for d in DOSES:
                 proj = data[f"proj_{d}"].astype(np.float32)
                 recons[f"SART {d}% dose"] = geometry.os_sart(proj, data["proj_valid"])
                 recons[f"FBP {d}% dose"] = geometry.fbp(proj)
             for name, volume in recons.items():
-                m = metrics(volume, gt, mask)
+                m = metrics(volume, ref, mask)
                 for key in ((split, "all"), (split, density), ("all", "all")):
                     results[name][key].append(m)
 
     lines = ["# VICTRE-Paired v11 Validation\n", f"Files checked: {len(files)}. Problems: {len(problems)}.\n"]
     lines += [f"- {p}" for p in problems]
-    lines += ["\n## Noise injection check\n",
+    lines += ["\n## Noise simulation check\n",
               "Measured extra noise variance over the noise model prediction (target 1.00).\n",
               "| Key | Mean | Min | Max |", "|---|---|---|---|"]
     for key, values in ratios.items():
         lines.append(f"| {key} | {np.mean(values):.3f} | {np.min(values):.3f} | {np.max(values):.3f} |")
     # second reference. Reported, not scored: victre_fbp is a reference a user may
-    # choose to measure against, never the ground truth of this release.
+    # choose to measure against in addition to sart_full; neither is the phantom.
     if second_ref["present"]:
         c, sat = second_ref["corr"], second_ref["saturated"]
         lines += ["\n## Second reference (victre_fbp)\n",
                   "| Quantity | Value |", "|---|---|",
-                  f"| Patients carrying it (metric splits) | {sum(second_ref['present'])} / {len(second_ref['present'])} |"]
+                  f"| Phantoms carrying it (metric splits) | {sum(second_ref['present'])} / {len(second_ref['present'])} |"]
         if c:
             lines.append(f"| corr(victre_fbp, sart_full) in the breast mask | {np.mean(c):.3f} [{np.min(c):.3f}, {np.max(c):.3f}] |")
             # Measured on the 8-patient smoke run: dense 0.52, hetero 0.49, scattered 0.45,
@@ -281,7 +281,7 @@ def main() -> None:
         if sat:
             lines.append(f"| Source voxels at the uint16 ceiling | mean {np.mean(sat):.2e}, max {np.max(sat):.2e} |")
         lines.append("")
-    lines.append("\n## Baselines against the ground truth (sart_full), inside the breast mask\n")
+    lines.append("\n## Baselines against the reference x_ref (sart_full), inside the breast mask\n")
     for name, rows in results.items():
         lines += table(rows, name)
     report = "\n".join(lines) + "\n"

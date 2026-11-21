@@ -1,7 +1,7 @@
 # VICTRE-Paired
 
 Code for **VICTRE-Paired v11**, a paired dataset for limited-angle digital breast tomosynthesis (DBT) reconstruction
-built from the VICTRE in-silico imaging trial.
+built from the VICTRE in silico imaging trial.
 
 > Y. T. Basak, M. O. Unal, M. Ertas, I. Yildirim. *A multi-dose Monte Carlo digital breast tomosynthesis dataset
 > with paired reference volumes.* Data Descriptor, submitted to Scientific Data (2026).
@@ -10,22 +10,24 @@ built from the VICTRE in-silico imaging trial.
 - **Source:** VICTRE trial on The Cancer Imaging Archive (CC BY 3.0) and lesion locations from
   [DIDSR/VICTRE](https://github.com/DIDSR/VICTRE).
 
-## What a record holds
+## What each file holds
 
-2,993 phantoms (train 2,349 / validation 322 / test 322) in four breast-density classes. Each record holds the
-25 Monte Carlo projections over ±25° and the mammogram at full dose; low-dose projections and mammograms at 50, 25
-and 10 % dose, made by adding calibrated quantum and electronic noise in the pre-log intensity domain; an OS-SART
+2,993 phantoms (train 2,349 / validation 322 / test 322) in four breast-density classes, one compressed NumPy
+file per phantom. Each file holds the 25 Monte Carlo projections over ±25° and the mammogram at full dose; low-dose
+projections and mammograms at 50, 25 and 10 % dose, made by adding calibrated quantum and electronic noise in the pre-log intensity domain; an OS-SART
 reconstruction of the full-dose projections (`sart_full`, the primary reference); VICTRE's own reconstruction
 (`victre_fbp`, second reference, for the 2,760 phantoms whose reconstruction TCIA publishes); the breast mask, the
 acquisition geometry, lesion locations and matched signal-absent controls. The Data Descriptor lists all 29 fields.
+Both references are full-dose reconstructions of the same projections, not the phantom itself; the Usage Notes
+of the Data Descriptor give the recommended evaluation protocol.
 
 ## Files
 
 | file | purpose |
 |---|---|
-| `dataset_generate.py` | Downloads the VICTRE source data and writes every record (resumable). |
-| `dataset_test.py` | Validates every record (keys, shapes, noise injection) and computes baseline metrics on the chosen splits; writes `validation.md` and `preview.png`. |
-| `dbt_2026v1_manifest.csv` | Frozen splits of the 384-phantom development set; these phantoms keep their split. |
+| `dataset_generate.py` | Downloads the VICTRE source data and writes one file per phantom (resumable). |
+| `dataset_test.py` | Validates every file (keys, shapes, noise simulation) and computes baseline metrics against `sart_full` on the chosen splits; writes `validation.md` and `preview.png`. |
+| `dbt_2026v1_manifest.csv` | Fixed splits of the 384-phantom development set; these phantoms keep their split. |
 | `notebooks/` | Google Colab notebooks that generated the release and produced every figure, table and number of the Data Descriptor (below). |
 | `notebooks/generators/` | The scripts that write the notebooks (`python3 build_01_analysis.py 01_analysis_colab.ipynb`); edit these, not the notebooks. |
 
@@ -34,13 +36,13 @@ acquisition geometry, lesion locations and matched signal-absent controls. The D
 | notebook | GPU | what it does |
 |---|---|---|
 | `00_generation_colab.ipynb` | yes | Runs `dataset_generate.py` over the collection in resumable sessions, then `dataset_test.py`, then writes `manifest.csv`. |
-| `01_analysis_colab.ipynb` | yes | Registry of the release, DELTA check of every file, and per-phantom baselines, detection, depth alignment, noise and data fit on the test split. |
+| `01_analysis_colab.ipynb` | yes | Registry of the release, DELTA check of every file, and per-phantom baselines, detection, depth alignment, noise and forward-model residual on the test split. |
 | `02_figures_tables_colab.ipynb` | no | Every figure, table and number of the Data Descriptor (`numbers.tex`), from the outputs of 01, 03–06. |
 | `03_extra_analysis_colab.ipynb` | yes | Four classical methods × three doses × two projection sources (Monte Carlo and synthetic), noise spectra, forward-model residuals; SART pass count and SART-TV weight chosen on the validation split. |
 | `04_training_colab.ipynb` | yes | A small supervised U-Net experiment showing that the training split is usable (supplementary material). |
 | `05_diagnostics_colab.ipynb` | yes | Diagnostics of depth alignment, scale, noise ratio and zero voxels of the reference. |
 | `06_delta_colab.ipynb` | yes | Checks the volume-height constant `DELTA` against VICTRE's own reconstruction. |
-| `07_delta_patch_colab.ipynb` | yes | Recomputes `sart_full`, `breast_mask` and `volume_box_mm` of the dense, heterogeneous and scattered records with the corrected `DELTA`. |
+| `07_delta_patch_colab.ipynb` | yes | Recomputes `sart_full`, `breast_mask` and `volume_box_mm` of the dense, heterogeneous and scattered phantoms from the stored 16-bit full-dose projections after `DELTA` was finalised; the other arrays do not depend on `DELTA`. |
 
 The notebooks read the scripts and the data from Google Drive; the paths are set in their first cells.
 
@@ -60,6 +62,11 @@ written to `config.json` in the output folder.
 
 The v9 code that preceded this release is kept under the git tag `v9`.
 
+## Citation
+
+If you use the dataset or the code, please cite the Data Descriptor above (the full reference will be added on
+publication) and the VICTRE sources it is derived from.
+
 ## Licence
 
-Code: MIT (see `LICENSE`). Data: see the Data Descriptor.
+Code: MIT (see `LICENSE`). Data: CC BY 4.0 (see the Data Descriptor).
