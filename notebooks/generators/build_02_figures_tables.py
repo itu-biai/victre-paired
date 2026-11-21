@@ -291,7 +291,7 @@ if need("tab1_schema", f0):
             avail = "where published" if k == "victre_fbp" else "all"
             body.append([tt(k), sh_s, dt, unit, desc, avail])
     write_table("tab1_schema", f"{f0.parent.name}/{f0.name}",
-        f"\\textbf{{Each record is one compressed \\texttt{{.npz}} file holding {len(body)} fields.}} The file key \\texttt{{patient}} is the VICTRE phantom identifier. $S$ is the number of 1\\,mm slices "
+        f"\\textbf{{Each phantom is stored as one compressed \\texttt{{.npz}} file holding {len(body)} fields.}} The file key \\texttt{{patient}} is the VICTRE phantom identifier. $S$ is the number of 1\\,mm slices "
         f"({SLC['dense']}, {SLC['hetero']}, {SLC['scattered']} and {SLC['fatty']} for the dense, heterogeneous, "
         "scattered and fatty classes).",
         "tab:schema", "@{}lll>{\\raggedright\\arraybackslash}p{0.13\\textwidth}>{\\raggedright\\arraybackslash}p{0.36\\textwidth}l@{}",
@@ -315,7 +315,7 @@ if need("tab2_composition", K):
         body.append(["", ] + row("\\textit{all}", Rs)); body.append("MIDRULE")
     body.append(["\\textbf{Total}"] + row("", K))
     write_table("tab2_composition", "analysis/registry.csv",
-        f"\\textbf{{The release holds {tex_int(len(K))} phantoms in frozen training, validation and test splits.}} Phantoms are counted as signal present / signal absent. Masses and "
+        f"\\textbf{{The release holds {tex_int(len(K))} phantoms in fixed training, validation and test splits.}} Phantoms are counted as signal present / signal absent. Masses and "
         "calcification clusters are the trial's insertions in signal-present phantoms; controls are the trial's "
         "matched lesion-free positions in signal-absent phantoms. \\texttt{victre\\_fbp} counts the phantoms "
         "for which TCIA publishes the trial's own reconstruction. All counts are read from the released files.",
@@ -866,9 +866,9 @@ rows = [("Views", f"{NV}, uniform over $\\pm{ANG:g}^\\circ$"), ("Source to centr
         ("OS-SART for $x_\\mathrm{ref}$", f"{CFGJ.get('sart_iterations', 10)} iterations $\\times$ {CFGJ.get('sart_subsets', 5)} subsets, non-negative, "
                                          f"{CFGJ.get('sart_depth_margin_slices', 8)} margin slices above and below")]
 rows += [(f"{DNAME[dn]}: slices, $\\Delta$", f"{SLC[dn]}, {DELTA[dn]:.3f} mm") for dn in DENS]
-rows += [("$\\Delta$ from the trial's code", f"20.0 mm object-to-detector distance less 0.5 mm, half the cover: {DELTA_PUB:.3f} mm")]
+rows += [("$\\Delta$ from the trial's code", f"20.0 mm breast height less 0.5 mm (half the cover): {DELTA_PUB:.3f} mm")]
 write_table("tabS2_geometry", "dataset_generate.py, config.json", "\\textbf{All density classes share one acquisition geometry and the same distance $\\Delta$ from the detector to the bottom of the reconstructed volume.} Acquisition geometry and reconstruction constants of the release.",
-            "tab:S2", "@{}ll@{}", [r"Quantity & Value \\"], [[a, b] for a, b in rows])
+            "tab:S2", "@{}lp{0.6\\textwidth}@{}", [r"Quantity & Value \\"], [[a, b] for a, b in rows])
 
 # ------------------------------------------------------------ S3: training table
 if need("tabS3_training", TM, TS):
@@ -922,10 +922,10 @@ if need("tabS5_noise", rows_n):
     order = [f"proj_{d}" for d in DOSES] + [f"dm_{d}" for d in DOSES]
     rows_n = sorted(rows_n, key=lambda r: order.index(r[0]) if r[0] in order else 99)
     write_table("tabS5_noise", src,
-        "\\textbf{The injected noise variance is close to the model prediction in every low-dose array.} Measured extra variance in each low-dose array over the variance the "
+        "\\textbf{The added noise variance is close to the model prediction in every low-dose array.} Measured extra variance in each low-dose array over the variance the "
         "noise model predicts from the stored photon count and electronic noise (target 1), as the ratio of the median measured to the median predicted variance over the pixels of each file. "
-        "The check verifies the injection for the stored $N_0$ and $\\sigma_e$; it does not test $N_0$ itself. "
-        "Re-injecting the model into the same arrays reproduces the shortfall below 1 (Technical Validation).",
+        "The check verifies the noise simulation for the stored $N_0$ and $\\sigma_e$; it does not test $N_0$ itself. "
+        "Re-simulating the noise for the same arrays reproduces the shortfall below 1 (Technical Validation).",
         "tab:S5", "lccc", [r"Array & mean & min & max \\"], [[tt(k), f"{a:.3f}", f"{lo:.3f}", f"{hi:.3f}"] for k, a, lo, hi in rows_n])
     NUM["NoiseMin"] = f"{min(r[2] for r in rows_n):.2f}"; NUM["NoiseMax"] = f"{max(r[3] for r in rows_n):.2f}"
     NUM["NoiseMeanMin"] = f"{min(r[1] for r in rows_n):.3f}"; NUM["NoiseMeanMax"] = f"{max(r[1] for r in rows_n):.3f}"
